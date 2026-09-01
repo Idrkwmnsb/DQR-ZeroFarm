@@ -1,0 +1,5 @@
+.DS_Store
+*.tmp
+.level_export/
+.tmp_icons/
+assets/
