@@ -1,14 +1,16 @@
 --[[
-    DQR ZeroFarm v8 — Cascade UI Edition
+    DQR ZeroFarm v8.1 — Cascade UI Edition
     Security audit PoC autofarm for Dungeon Quest Reborn
 
-    v8 changes:
-      • Trajectory-predicting projectile dodge with micro-teleport + MoveTo hybrid
-      • Stand-and-fight combat: hold position, let aggroed mobs approach
-      • Smarter target selection (room-aware, distance-weighted, sticky)
-      • Smoother pathfinding with less jitter
-      • Fixed WalkSpeed Stepper (proper Min/Max/Increment)
-      • Expanded threat detection (PrecastHitbox zones, velocity tracking)
+    v8.1 dodge rewrite:
+      • Per-frame (Heartbeat) threat scan + trajectory prediction — ~16ms reaction
+      • Minimal-offset dodging: moves only far enough to clear the projectile
+      • Obstacle-aware: raycasts every dodge candidate, never steps into walls
+      • Micro-teleport is last-resort only (tiny, capped) when a hit is unavoidable
+      • Freeze fixed at the source: no post-dodge wait, arbiter re-issues MoveTo on
+        target change, movement re-armed immediately after a micro-TP
+      • Attacks (kill aura / abilities) never pause for dodging
+      • Live breadcrumbs HUD: action / threat / prediction / target / reason
 
     Execute in your executor directly.
     _G.StopZF() to stop | Right Ctrl to minimize
@@ -20,14 +22,15 @@
 local C = {
     Speed        = 20,
     FarmDist     = 26,
-    OrbitDist    = 20,
     KillAura     = true,
     AutoAbility  = true,
     AutoDodge    = true,
-    DodgeRange   = 45,
+    DodgeRange   = 50,
     AutoStart    = true,
     NoStun       = true,
     Noclip       = false,
+    Debug        = true,
+    ClearDebris  = false,
     AbilityCD    = 0.15,
     RepathMin    = 0.35,
     MoveTimeout  = 1.5,
@@ -35,22 +38,15 @@ local C = {
     StuckRetry   = 0.6,
     TargetEscape = 14,
     LeadTime     = 0.35,
-    -- v8 additions
-    DetectRadius   = 60,   -- radius to consider enemies "nearby" before seeking new targets
-    HoldDist       = 12,   -- preferred standoff distance from aggroed enemy
-    DodgeSamples   = 12,   -- number of angular samples for safe-position grid
-    DodgeRadiusMin = 5,    -- inner ring distance for dodge candidates
-    DodgeRadiusMax = 10,   -- outer ring distance for dodge candidates (keep small to avoid kicks)
-    ThreatLookahead = 0.6, -- seconds to project threat trajectories forward
-    ThreatBuffer   = 4,    -- extra studs around threat hitbox to consider dangerous
-    SafeReturnTime = 0.3,  -- seconds after last dodge before resuming normal behavior
-    MaxTpDist      = 10,   -- max CFrame teleport distance per dodge (studs, keep <=10 to avoid kicks)
-    TpCooldown     = 0.15, -- minimum seconds between teleport dodges
-    UrgentDist     = 18,   -- threat closer than this + moving toward player = instant CFrame snap
-    WalkDodgeDist  = 35,   -- threat at this range = use MoveTo instead of teleport
-    ReturnDrift    = 0.4,  -- how fast to drift back to anchor after dodging (0-1 lerp factor per tick)
-    AnchorMaxAge   = 2.5,  -- discard anchor if dodge sequence lasted longer than this (seconds)
-    PostTpRecheck  = true, -- re-validate position after every micro-teleport; re-dodge if still unsafe
+    DetectRadius = 60,
+    HoldDist     = 12,
+    -- dodge tuning
+    ThreatBuffer    = 2.5,  -- extra studs added to each threat's radius
+    DodgeMargin     = 2,    -- clearance beyond the danger radius when stepping aside
+    ThreatLookahead = 0.8,  -- seconds ahead to predict incoming projectiles
+    MaxTpDist       = 6,    -- last-resort micro-teleport cap (studs) — small on purpose
+    TpReactTime     = 0.12, -- impact sooner than this + walk can't reach = micro-TP
+    DodgeMax        = 14,   -- never step further than this in one dodge (studs)
 }
 _G.ZF = C
 
@@ -94,7 +90,7 @@ app = cascade.New({
 
 local window = app:Window({
     Title = "ZeroFarm",
-    Subtitle = "DQR Autofarm v8",
+    Subtitle = "DQR Autofarm v8.1",
     Draggable = true,
     Searching = true,
     Size = UIS.TouchEnabled and UDim2.fromOffset(500, 320) or UDim2.fromOffset(750, 480),
@@ -129,12 +125,13 @@ do -- Combat tab
 
     toggle(form, "Kill Aura", "Spam weaponUsed remote to hit nearby enemies.", "KillAura")
     toggle(form, "Auto Ability", "Cast Q/E abilities via Tool localEvent, respects cooldowns.", "AutoAbility")
-    toggle(form, "Auto Dodge", "Trajectory-predicting projectile avoidance.", "AutoDodge")
+    toggle(form, "Auto Dodge", "Predictive, minimal-offset projectile avoidance.", "AutoDodge")
     toggle(form, "No Stun", "Remove stunned tag and PlatformStand.", "NoStun")
     toggle(form, "Noclip", "Walk through walls and objects.", "Noclip")
     toggle(form, "Auto Start", "Auto ready-up and start dungeons.", "AutoStart")
+    toggle(form, "Debug HUD", "Show live dodge breadcrumbs overlay.", "Debug")
+    toggle(form, "Clear Debris", "Hide small loose parts so they can't block dodges.", "ClearDebris")
 
-    -- [v8 FIX] WalkSpeed Stepper: explicit Min/Max/Increment so it accepts real values
     do
         local row = form:Row({ SearchIndex = "WalkSpeed" })
         row:Left():TitleStack({ Title = "WalkSpeed", Subtitle = "16 = default, 20-25 safe, higher risks detection." })
@@ -146,7 +143,6 @@ do -- Combat tab
             Increment = 1,
             ValueChanged = function(_, v)
                 C.Speed = math.clamp(v, 0, 50)
-                -- actively apply the new speed immediately
                 local p = lp()
                 if p and p.Character then
                     local hum = p.Character:FindFirstChild("Humanoid")
@@ -218,20 +214,20 @@ do -- Movement tab
     end
 
     do
-        local row = form:Row({ SearchIndex = "Lead Time" })
-        row:Left():TitleStack({ Title = "Lead Time", Subtitle = "Aim ahead of moving enemies (seconds)." })
-        row:Right():Slider({
-            Value = C.LeadTime,
-            ValueChanged = function(_, v) C.LeadTime = v end,
-        })
-    end
-
-    do
         local row = form:Row({ SearchIndex = "Threat Lookahead" })
         row:Left():TitleStack({ Title = "Threat Lookahead", Subtitle = "Seconds to project projectile trajectories." })
         row:Right():Slider({
             Value = C.ThreatLookahead,
             ValueChanged = function(_, v) C.ThreatLookahead = math.clamp(v, 0.1, 2.0) end,
+        })
+    end
+
+    do
+        local row = form:Row({ SearchIndex = "Lead Time" })
+        row:Left():TitleStack({ Title = "Lead Time", Subtitle = "Aim ahead of moving enemies (seconds)." })
+        row:Right():Slider({
+            Value = C.LeadTime,
+            ValueChanged = function(_, v) C.LeadTime = v end,
         })
     end
 end
@@ -372,12 +368,21 @@ local function flatDist(a, b)
     return math.sqrt(dx * dx + dz * dz)
 end
 
+-- Shared dodge/AI state (declared early so CharacterAdded handlers can reset it)
+local DODGE = {
+    active     = false,
+    lastTp     = 0,
+    baseAction = "scan",   -- what the AI would do if no threat (set by main loop)
+    breadcrumb = { action = "init", threat = "none", predict = "-", target = "-", reason = "-" },
+}
+
 -- ============================================================
 -- MOVEMENT ARBITER
 -- ============================================================
 local MOVE_PRIORITY = { dodge = 4, hold = 3, orbit = 2, path = 1 }
 local intent = { owner = "none", pos = nil, untilT = 0 }
 local lastMoveSent = 0
+local lastMovePos = nil
 
 local function requestMove(owner, pos, ttl)
     local now = tick()
@@ -398,6 +403,7 @@ local function clearMove(owner)
     end
 end
 
+-- [v8.1] Re-issue MoveTo the instant the target moves (fixes dodge lag / post-dodge freeze).
 conns.move = RunS.Heartbeat:Connect(function()
     if not running then return end
     local hum = getHum()
@@ -407,9 +413,11 @@ conns.move = RunS.Heartbeat:Connect(function()
         intent.pos = nil
         return
     end
-    if tick() - lastMoveSent >= 0.12 then
+    local moved = (not lastMovePos) or (intent.pos - lastMovePos).Magnitude > 0.5
+    if moved or tick() - lastMoveSent >= 0.06 then
         hum:MoveTo(intent.pos)
         lastMoveSent = tick()
+        lastMovePos = intent.pos
     end
 end)
 
@@ -418,7 +426,6 @@ end)
 -- ============================================================
 local function getAllEnemies()
     local out = {}
-    -- workspace.enemies folder
     local ef = workspace:FindFirstChild("enemies")
     if ef then
         for _, v in ef:GetChildren() do
@@ -427,7 +434,6 @@ local function getAllEnemies()
             end
         end
     end
-    -- workspace.dungeon room folders
     local dun = workspace:FindFirstChild("dungeon")
     if dun then
         for _, room in dun:GetChildren() do
@@ -441,20 +447,16 @@ local function getAllEnemies()
             end
         end
     end
-    -- [v8] mobs cloned directly into workspace
+    -- mobs cloned directly into workspace
     for _, v in workspace:GetChildren() do
         if v:IsA("Model") and v:FindFirstChild("Humanoid") and v:FindFirstChild("HumanoidRootPart") then
             if v.Humanoid.Health > 0 and v ~= getChar() then
-                -- check it's an enemy (has enemy nameplate or is tagged)
                 if v:FindFirstChild("enemyNameplate") or v:FindFirstChild("enemyTag") or v:FindFirstChild("enemyLevel") then
-                    -- avoid duplicates from enemies folder
                     local dominated = false
                     for _, existing in out do
                         if existing == v then dominated = true; break end
                     end
-                    if not dominated then
-                        table.insert(out, v)
-                    end
+                    if not dominated then table.insert(out, v) end
                 end
             end
         end
@@ -462,11 +464,9 @@ local function getAllEnemies()
     return out
 end
 
--- [v8] Room number for an enemy (for room-aware targeting)
 local function getEnemyRoom(enemy)
     local parent = enemy.Parent
     if not parent then return 0 end
-    -- if in enemyFolder inside a room
     if parent.Name == "enemyFolder" then
         local room = parent.Parent
         if room then
@@ -475,15 +475,12 @@ local function getEnemyRoom(enemy)
             if room.Name == "bossRoom" then return 999 end
         end
     end
-    -- workspace.enemies or workspace direct — room 0
     return 0
 end
 
--- [v8] Sticky target tracking
 local currentTarget = nil
-local targetLockedAt = 0
 
--- [v8] Smart target selection: prefers closest within same/nearest room, sticky
+-- Room-aware sticky target selection
 local function selectTarget()
     local hrp = getHRP()
     if not hrp then return nil, math.huge end
@@ -494,7 +491,6 @@ local function selectTarget()
         return nil, math.huge
     end
 
-    -- if current target is still valid and within detect radius, keep it
     if currentTarget and currentTarget.Parent and currentTarget:FindFirstChild("Humanoid")
         and currentTarget.Humanoid.Health > 0 and currentTarget:FindFirstChild("HumanoidRootPart") then
         local d = (pos - currentTarget.HumanoidRootPart.Position).Magnitude
@@ -503,30 +499,19 @@ local function selectTarget()
         end
     end
 
-    -- score enemies: lower = better
     local best, bestScore = nil, math.huge
     for _, e in enemies do
         local ok, d = pcall(function()
             return (pos - e.HumanoidRootPart.Position).Magnitude
         end)
         if ok then
-            local roomNum = getEnemyRoom(e)
-            -- score: distance + small room penalty to prefer current/nearest room
-            local score = d + roomNum * 0.5
-            -- bonus: enemies already close get priority
-            if d <= C.FarmDist then
-                score = score - 20
-            end
-            if score < bestScore then
-                best, bestScore = e, score
-            end
+            local score = d
+            if d <= C.FarmDist then score = score - 20 end
+            if score < bestScore then best, bestScore = e, score end
         end
     end
 
-    if best then
-        currentTarget = best
-        targetLockedAt = tick()
-    end
+    if best then currentTarget = best end
 
     local d = math.huge
     if best and best:FindFirstChild("HumanoidRootPart") then
@@ -535,7 +520,6 @@ local function selectTarget()
     return best, d
 end
 
--- [v8] Find nearest enemy (for kill aura / quick checks)
 local function nearest()
     local hrp = getHRP()
     if not hrp then return nil, math.huge end
@@ -549,7 +533,6 @@ local function nearest()
     return best, bestD
 end
 
--- [v8] Check if any enemies exist within detect radius
 local function hasNearbyEnemies()
     local hrp = getHRP()
     if not hrp then return false end
@@ -590,11 +573,7 @@ local function followPath(path, targetModel, goalPos)
 
     for _, wp in ipairs(waypoints) do
         if not running then return exit("stopped") end
-
-        -- [v8] if enemies appeared near us while pathing, stop and fight
-        if hasNearbyEnemies() then
-            return exit("engage")
-        end
+        if hasNearbyEnemies() then return exit("engage") end
 
         if targetModel then
             if not targetModel.Parent or not targetModel:FindFirstChild("Humanoid") or targetModel.Humanoid.Health <= 0 then
@@ -618,7 +597,6 @@ local function followPath(path, targetModel, goalPos)
             if not hrp then break end
             if (hrp.Position - wp.Position).Magnitude < C.ArriveRadius then break end
             if tick() - t0 > C.MoveTimeout then break end
-            -- [v8] interrupt path if enemies appeared nearby
             if hasNearbyEnemies() then return exit("engage") end
             requestMove("path", wp.Position, 0.25)
             task.wait(0.1)
@@ -724,7 +702,7 @@ local function nextRoomPos()
 end
 
 -- ============================================================
--- SPEED  [v8 FIXED]
+-- SPEED
 -- ============================================================
 local speedConn = nil
 local function hookSpeed()
@@ -740,16 +718,6 @@ local function hookSpeed()
     end)
 end
 hookSpeed()
-
--- [v8] Heartbeat speed enforcer — catches cases where the game resets WalkSpeed
--- between PropertyChanged fires, and ensures C.Speed changes propagate immediately
-conns.speedEnforce = RunS.Heartbeat:Connect(function()
-    if not running then return end
-    local hum = getHum()
-    if hum and hum.WalkSpeed ~= C.Speed then
-        hum.WalkSpeed = C.Speed
-    end
-end)
 
 conns.charSpeed = lp().CharacterAdded:Connect(function()
     task.wait(0.5)
@@ -795,8 +763,8 @@ conns.charAdded = lp().CharacterAdded:Connect(function()
     intent.owner = "none"
     intent.pos = nil
     currentTarget = nil
-    dodgeAnchor = nil
-    consecutiveDodges = 0
+    DODGE.active = false
+    DODGE.lastTp = 0
 end)
 
 -- ============================================================
@@ -840,15 +808,24 @@ task.spawn(function()
 end)
 
 -- ============================================================
--- NOCLIP
+-- NOCLIP  (only touches collisions while enabled)
 -- ============================================================
 local noclipConn = nil
+local noclipRestored = true
 local function hookNoclip()
     if noclipConn then noclipConn:Disconnect(); noclipConn = nil end
     noclipConn = RunS.Stepped:Connect(function()
         if not running then return end
-        if not C.Noclip then
-            -- restore collisions once when toggled off
+        if C.Noclip then
+            local char = getChar()
+            if char then
+                for _, p in char:GetDescendants() do
+                    if p:IsA("BasePart") and p.CanCollide then p.CanCollide = false end
+                end
+            end
+            noclipRestored = false
+        elseif not noclipRestored then
+            -- restore collisions once after toggling off
             local char = getChar()
             if char then
                 for _, p in char:GetDescendants() do
@@ -857,15 +834,7 @@ local function hookNoclip()
                     end
                 end
             end
-            return
-        end
-        local char = getChar()
-        if char then
-            for _, p in char:GetDescendants() do
-                if p:IsA("BasePart") then
-                    p.CanCollide = false
-                end
-            end
+            noclipRestored = true
         end
     end)
 end
@@ -873,11 +842,12 @@ hookNoclip()
 
 conns.charNoclip = lp().CharacterAdded:Connect(function()
     task.wait(0.3)
+    noclipRestored = true
     if running then hookNoclip() end
 end)
 
 -- ============================================================
--- KILL AURA
+-- KILL AURA  (independent — never pauses for dodging)
 -- ============================================================
 task.spawn(function()
     while running do
@@ -892,7 +862,7 @@ task.spawn(function()
 end)
 
 -- ============================================================
--- AUTO ABILITY
+-- AUTO ABILITY  (independent — never pauses for dodging)
 -- ============================================================
 local function findAbilityTool(slot)
     for _, t in lp().Backpack:GetChildren() do
@@ -970,9 +940,8 @@ task.spawn(function()
 end)
 
 -- ============================================================
--- [v8] THREAT TRACKER — velocity-tracking projectile awareness
+-- THREAT TRACKER — velocity-estimating projectile awareness
 -- ============================================================
--- Expanded danger part names (from game script analysis)
 local DANGER = {
     hitbox=1, hitBox=1, damagepart=1, damagePart=1, trappart=1, trapPart=1,
     lavaline=1, lavaLine=1, groundflame=1, groundFlame=1,
@@ -985,488 +954,300 @@ local DANGER = {
     lineshot=1, lineShot=1, circlehit=1, circleHit=1,
     shurikenhit=1, shurikenHit=1, hammerbothit=1, hammerBotHit=1,
     flamingshuriken=1, flamingShuriken=1,
-    -- additional from game analysis
     damageArea=1, wave=1, sword=1,
 }
 
--- Is this part a PrecastHitbox zone? (Neon, Anchored, non-collidable, in workspace)
+-- Neon AoE zone: Neon, anchored, non-collidable, reasonably sized, actually visible.
 local function isPrecastZone(part)
     if not part:IsA("BasePart") then return false end
     if part.Material ~= Enum.Material.Neon then return false end
     if not part.Anchored then return false end
     if part.CanCollide then return false end
+    if part.Transparency >= 1 then return false end
     if part.Parent ~= workspace then return false end
-    -- PrecastHitbox parts have no Name set (default "Part") or are Shape-based
+    local m = math.max(part.Size.X, part.Size.Y, part.Size.Z)
+    if m < 2 or m > 30 then return false end  -- skip decor / lighting slabs
     return true
 end
 
-local threats = {}          -- [BasePart] = true
-local threatData = {}       -- [BasePart] = { lastPos: Vector3, velocity: Vector3, radius: number }
-local lastDodgeTime = 0     -- timestamp of last dodge action
+local threats = {}      -- [BasePart] = true
+local threatData = {}    -- [BasePart] = { lastPos, velocity, radius }
 
--- Track new danger parts
 conns.ptAdd = workspace.DescendantAdded:Connect(function(d)
     if not d:IsA("BasePart") then return end
-    if DANGER[d.Name] or isPrecastZone(d) then
-        threats[d] = true
-    end
+    if DANGER[d.Name] or isPrecastZone(d) then threats[d] = true end
 end)
-
 conns.ptRem = workspace.DescendantRemoving:Connect(function(d)
     threats[d] = nil
     threatData[d] = nil
 end)
 
--- Scan existing workspace for precast zones on init
+-- Init scan seeds ONLY explicitly-named danger parts. Neon "precast" zones are
+-- only trusted when they spawn dynamically (via DescendantAdded) during a fight —
+-- pre-existing neon is almost always harmless lobby/map decor.
 task.spawn(function()
     for _, d in workspace:GetDescendants() do
-        if d:IsA("BasePart") and (DANGER[d.Name] or isPrecastZone(d)) then
+        if d:IsA("BasePart") and DANGER[d.Name] then
             threats[d] = true
         end
     end
 end)
 
--- Velocity tracker: runs every heartbeat, updates estimated velocity for each threat
+-- estimate velocity of CFrame-animated projectiles from position deltas
 conns.threatTrack = RunS.Heartbeat:Connect(function(dt)
-    if not running then return end
-    if dt <= 0 then return end
-
+    if not running or dt <= 0 then return end
     for part in pairs(threats) do
         if not part.Parent then
-            threats[part] = nil
-            threatData[part] = nil
-            continue
+            threats[part] = nil; threatData[part] = nil; continue
         end
-
         local ok, pos = pcall(function() return part.Position end)
         if not ok then
-            threats[part] = nil
-            threatData[part] = nil
-            continue
+            threats[part] = nil; threatData[part] = nil; continue
         end
-
         local data = threatData[part]
         if data then
-            -- estimate velocity from position delta (works for CFrame-animated projectiles)
             local rawVel = (pos - data.lastPos) / dt
-            -- smooth velocity with exponential moving average to reduce jitter
             data.velocity = data.velocity:Lerp(rawVel, 0.4)
             data.lastPos = pos
         else
-            -- first frame: no velocity yet
             local sz = part.Size
-            local radius = math.max(sz.X, sz.Y, sz.Z) * 0.5
             threatData[part] = {
                 lastPos = pos,
                 velocity = Vector3.zero,
-                radius = radius,
+                radius = math.max(sz.X, sz.Y, sz.Z) * 0.5,
             }
         end
     end
 end)
 
 -- ============================================================
--- [v8] SAFE-POSITION DODGE SYSTEM
+-- DODGE SYSTEM  [v8.1]  — predict, step minimally, never freeze
 -- ============================================================
--- Given a set of active threats and player position, find the nearest safe position.
--- Uses grid sampling: check candidate positions in a ring around the player.
 
-local function isPositionSafe(candidatePos, playerY, activeThreatList, lookahead)
-    for _, t in activeThreatList do
-        local pos = t.pos
-        local vel = t.vel
-        local dangerRadius = t.radius + C.ThreatBuffer
-
-        -- check current overlap
-        local flatD = flatDist(candidatePos, pos)
-        if flatD < dangerRadius then
-            return false
-        end
-
-        -- check predicted positions over lookahead window (sample 5 timesteps for tighter coverage)
-        local velMag = vel.Magnitude
-        if velMag > 1 then
-            for step = 1, 5 do
-                local futureT = lookahead * (step / 5)
-                local futurePos = pos + vel * futureT
-                local futureD = flatDist(candidatePos, futurePos)
-                if futureD < dangerRadius then
-                    return false
-                end
-            end
-
-            -- check closest approach along the velocity line
-            local toCandidate = Vector3.new(candidatePos.X - pos.X, 0, candidatePos.Z - pos.Z)
-            local velFlat = Vector3.new(vel.X, 0, vel.Z)
-            local velFlatMag = velFlat.Magnitude
-            if velFlatMag > 1 then
-                local velDir = velFlat / velFlatMag
-                local proj = toCandidate:Dot(velDir)
-                if proj > 0 and proj < velFlatMag * lookahead then
-                    local closestPoint = Vector3.new(pos.X, 0, pos.Z) + velDir * proj
-                    local perpDist = flatDist(candidatePos, closestPoint)
-                    if perpDist < dangerRadius then
-                        return false
-                    end
-                end
-            end
-        end
+-- Time (s) until a threat's danger circle first reaches the player's position.
+-- Returns nil if it never does within the trajectory. 0 = already inside.
+local function timeToHit(pp, tp, tv, dangerR)
+    local rx, rz = tp.X - pp.X, tp.Z - pp.Z
+    local vx, vz = tv.X, tv.Z
+    local a = vx * vx + vz * vz
+    local c = rx * rx + rz * rz - dangerR * dangerR
+    if a < 1e-4 then
+        return (c <= 0) and 0 or nil  -- stationary: only a threat if we're inside it
     end
-    return true
+    if c <= 0 then return 0 end       -- already inside
+    local b = 2 * (rx * vx + rz * vz)
+    local disc = b * b - 4 * a * c
+    if disc < 0 then return nil end
+    local t1 = (-b - math.sqrt(disc)) / (2 * a)
+    if t1 >= 0 then return t1 end
+    return nil                          -- entry is in the past → moving away
 end
 
-local function findSafePosition(overrideThreatList)
-    local hrp = getHRP()
-    if not hrp then return nil end
-    local playerPos = hrp.Position
-    local playerY = playerPos.Y
-
-    -- use pre-built list if provided (from dodge loop), otherwise collect
-    local activeThreatList = overrideThreatList
-    if not activeThreatList then
-        activeThreatList = {}
-        for part in pairs(threats) do
-            if not part.Parent then continue end
-            local data = threatData[part]
-            if not data then continue end
-            local d = flatDist(playerPos, data.lastPos)
-            if d <= C.DodgeRange then
-                table.insert(activeThreatList, {
-                    pos = data.lastPos,
-                    vel = data.velocity,
-                    radius = data.radius,
-                })
-            end
-        end
-    end
-
-    if #activeThreatList == 0 then return nil end
-
-    -- sample candidate positions in rings around the player
-    local bestPos = nil
-    local bestDist = math.huge
-    local angleStep = (math.pi * 2) / C.DodgeSamples
-
-    for ring = 1, 2 do
-        local radius = (ring == 1) and C.DodgeRadiusMin or C.DodgeRadiusMax
-        for i = 0, C.DodgeSamples - 1 do
-            local angle = angleStep * i
-            local candidate = Vector3.new(
-                playerPos.X + math.cos(angle) * radius,
-                playerY,
-                playerPos.Z + math.sin(angle) * radius
-            )
-
-            if isPositionSafe(candidate, playerY, activeThreatList, C.ThreatLookahead) then
-                local d = flatDist(playerPos, candidate)
-                if d < bestDist then
-                    bestDist = d
-                    bestPos = candidate
-                end
-            end
-        end
-        -- if we found something in inner ring, prefer it
-        if bestPos then break end
-    end
-
-    -- fallback: if no completely safe position, pick the one with fewest/farthest threats
-    if not bestPos then
-        local leastBadPos = nil
-        local leastBadScore = -math.huge
-
-        for ring = 1, 2 do
-            local radius = (ring == 1) and C.DodgeRadiusMin or C.DodgeRadiusMax
-            for i = 0, C.DodgeSamples - 1 do
-                local angle = angleStep * i
-                local candidate = Vector3.new(
-                    playerPos.X + math.cos(angle) * radius,
-                    playerY,
-                    playerPos.Z + math.sin(angle) * radius
-                )
-
-                -- score: sum of distances from all threats (higher = safer)
-                local score = 0
-                for _, t in activeThreatList do
-                    score = score + flatDist(candidate, t.pos)
-                    -- bonus for being perpendicular to velocity
-                    local velMag = t.vel.Magnitude
-                    if velMag > 1 then
-                        local toCandidate = Vector3.new(candidate.X - t.pos.X, 0, candidate.Z - t.pos.Z)
-                        local velDir = t.vel.Unit
-                        local dot = math.abs(toCandidate.Unit:Dot(velDir))
-                        score = score + (1 - dot) * 10 -- perpendicular = bonus
-                    end
-                end
-                -- penalize distance from player
-                score = score - flatDist(playerPos, candidate) * 0.5
-
-                if score > leastBadScore then
-                    leastBadScore = score
-                    leastBadPos = candidate
-                end
-            end
-        end
-
-        bestPos = leastBadPos
-    end
-
-    return bestPos
+-- Raycast the straight line to a candidate dodge spot; true if no solid wall blocks it.
+local rayParams = RaycastParams.new()
+rayParams.FilterType = Enum.RaycastFilterType.Exclude
+local function clearPath(fromPos, toPos)
+    local char = getChar()
+    rayParams.FilterDescendantsInstances = char and { char } or {}
+    local dir = toPos - fromPos
+    if dir.Magnitude < 0.1 then return true end
+    local res = workspace:Raycast(fromPos, dir, rayParams)
+    if not res then return true end
+    if not res.Instance.CanCollide then return true end       -- effects/props aren't walls
+    local m = res.Instance:FindFirstAncestorWhichIsA("Model")
+    if m and m:FindFirstChild("Humanoid") then return true end -- enemies aren't walls
+    return false
 end
 
--- [v8] Micro-teleport helper: CFrame snap capped to MaxTpDist
-local lastTpTime = 0
-
+-- Tiny last-resort snap; capped hard at MaxTpDist, preserves facing, keeps velocity intent.
 local function microTeleport(targetPos)
     local hrp = getHRP()
-    if not hrp then return false end
-    local now = tick()
-    if now - lastTpTime < C.TpCooldown then return false end
-
-    local current = hrp.Position
-    local delta = targetPos - current
-    local flatDelta = Vector3.new(delta.X, 0, delta.Z)
-    local dist = flatDelta.Magnitude
-
-    if dist < 0.5 then return false end -- too small to bother
-
-    -- clamp distance to MaxTpDist to avoid anti-cheat kicks
-    if dist > C.MaxTpDist then
-        flatDelta = flatDelta.Unit * C.MaxTpDist
-    end
-
-    local newPos = Vector3.new(current.X + flatDelta.X, current.Y, current.Z + flatDelta.Z)
-    hrp.CFrame = CFrame.new(newPos) * (hrp.CFrame - hrp.CFrame.Position) -- preserve rotation
-    lastTpTime = now
-    return true
+    if not hrp then return end
+    if tick() - DODGE.lastTp < 0.1 then return end
+    local delta = targetPos - hrp.Position
+    local flat = Vector3.new(delta.X, 0, delta.Z)
+    local d = flat.Magnitude
+    if d < 0.3 then return end
+    if d > C.MaxTpDist then flat = flat.Unit * C.MaxTpDist end
+    hrp.CFrame = hrp.CFrame + flat
+    DODGE.lastTp = tick()
 end
 
--- Threat urgency assessment: is any threat about to hit the player imminently?
-local function assessUrgency(playerPos, activeThreatList)
-    local maxUrgency = 0 -- 0 = safe, 1 = approaching, 2 = imminent
-
-    for _, t in activeThreatList do
-        local dist = flatDist(playerPos, t.pos)
-        local vel = t.vel
-        local velMag = vel.Magnitude
-
-        -- check if threat is moving toward the player
-        local movingToward = false
-        if velMag > 2 then
-            local toPlayer = Vector3.new(playerPos.X - t.pos.X, 0, playerPos.Z - t.pos.Z)
-            if toPlayer.Magnitude > 0.1 then
-                local dot = toPlayer.Unit:Dot(Vector3.new(vel.X, 0, vel.Z).Unit)
-                movingToward = dot > 0.3
-            end
-        end
-
-        if dist < C.UrgentDist and movingToward then
-            -- imminent: projectile is close AND heading our way
-            maxUrgency = 2
-            break
-        elseif dist < C.UrgentDist then
-            -- close but not moving toward us — still somewhat urgent (could be AoE)
-            maxUrgency = math.max(maxUrgency, 2)
-        elseif dist < C.WalkDodgeDist and movingToward then
-            maxUrgency = math.max(maxUrgency, 1)
-        end
+-- Main dodge brain — runs every frame for ~16ms reaction, no task.wait scheduling jitter.
+conns.dodge = RunS.Heartbeat:Connect(function()
+    if not running then return end
+    local bc = DODGE.breadcrumb
+    if not C.AutoDodge then
+        DODGE.active = false
+        bc.action = "dodge off"; bc.threat = "-"; bc.predict = "-"; bc.target = "-"; bc.reason = "-"
+        return
     end
+    if not isAlive() then return end
+    local hrp = getHRP()
+    if not hrp then return end
+    local pp = hrp.Position
 
-    return maxUrgency
-end
-
--- [v8] Dodge anchor: remember where we were before dodging so we can drift back
-local dodgeAnchor = nil   -- Vector3 or nil
-local anchorSetAt = 0     -- tick() when anchor was stored
-local consecutiveDodges = 0
-
--- Helper: collect active threat snapshot for current player position
-local function collectThreats(playerPos)
-    local list = {}
+    -- find the single most imminent threat and the minimal escape it requires
+    local best
     for part in pairs(threats) do
         if not part.Parent then continue end
         local data = threatData[part]
         if not data then continue end
-        local d = flatDist(playerPos, data.lastPos)
-        if d <= C.DodgeRange then
-            table.insert(list, {
-                pos = data.lastPos,
-                vel = data.velocity,
-                radius = data.radius,
-            })
+        local tp = data.lastPos
+        if flatDist(pp, tp) > C.DodgeRange then continue end
+
+        local tv = data.velocity
+        local dangerR = data.radius + C.ThreatBuffer
+        local tImpact = timeToHit(pp, tp, tv, dangerR)
+        if tImpact == nil or tImpact > C.ThreatLookahead then continue end
+
+        local dodgeDir, need
+        local sp = Vector3.new(tv.X, 0, tv.Z).Magnitude
+        if sp > 1 then
+            -- moving projectile: step perpendicular to its travel line, only until we clear it
+            local vdir = Vector3.new(tv.X, 0, tv.Z) / sp
+            local toP = Vector3.new(pp.X - tp.X, 0, pp.Z - tp.Z)
+            local along = toP:Dot(vdir)
+            local closest = Vector3.new(tp.X, 0, tp.Z) + vdir * along
+            local perpVec = Vector3.new(pp.X - closest.X, 0, pp.Z - closest.Z)
+            local perpDist = perpVec.Magnitude
+            need = (dangerR + C.DodgeMargin) - perpDist
+            if need <= 0 then continue end  -- it's going to miss us anyway
+            dodgeDir = (perpDist > 0.1) and (perpVec / perpDist)
+                       or Vector3.new(-vdir.Z, 0, vdir.X)
+        else
+            -- stationary AoE we're standing in: step straight out, minimally
+            local away = Vector3.new(pp.X - tp.X, 0, pp.Z - tp.Z)
+            local ad = away.Magnitude
+            need = (dangerR + C.DodgeMargin) - ad
+            if need <= 0 then continue end
+            dodgeDir = (ad > 0.1) and (away / ad) or Vector3.new(1, 0, 0)
+        end
+
+        if not best or tImpact < best.t then
+            best = { t = tImpact, dir = dodgeDir, need = math.min(need, C.DodgeMax), name = part.Name }
         end
     end
-    return list
-end
 
--- [v8] Dodge loop: hybrid CFrame snap / MoveTo with post-TP recheck + anchor return
-task.spawn(function()
-    while running do
-        if C.AutoDodge and isAlive() then
-            local hrp = getHRP()
-            if hrp then
-                local playerPos = hrp.Position
-                local activeThreatList = collectThreats(playerPos)
+    if not best then
+        if DODGE.active then clearMove("dodge"); DODGE.active = false end
+        bc.action = DODGE.baseAction
+        bc.threat = "none"; bc.predict = "-"; bc.target = "-"; bc.reason = "clear"
+        return
+    end
 
-                if #activeThreatList > 0 then
-                    local currentSafe = isPositionSafe(playerPos, playerPos.Y, activeThreatList, C.ThreatLookahead)
-
-                    if not currentSafe then
-                        -- store anchor before first dodge in a sequence
-                        if not dodgeAnchor or (tick() - anchorSetAt > C.AnchorMaxAge) then
-                            dodgeAnchor = playerPos
-                            anchorSetAt = tick()
-                        end
-
-                        local safePos = findSafePosition(activeThreatList)
-                        if safePos then
-                            local urgency = assessUrgency(playerPos, activeThreatList)
-
-                            if urgency >= 2 then
-                                -- IMMINENT: instant CFrame snap (micro-teleport)
-                                local tpOk = microTeleport(safePos)
-                                lastDodgeTime = tick()
-                                consecutiveDodges = consecutiveDodges + 1
-
-                                -- POST-TP RECHECK: did we land on another projectile?
-                                if tpOk and C.PostTpRecheck then
-                                    local newHrp = getHRP()
-                                    if newHrp then
-                                        local newPos = newHrp.Position
-                                        local recheckThreats = collectThreats(newPos)
-                                        if #recheckThreats > 0 and not isPositionSafe(newPos, newPos.Y, recheckThreats, C.ThreatLookahead) then
-                                            -- still unsafe — find a DIFFERENT safe position from the new location
-                                            local escapeSafe = findSafePosition(recheckThreats)
-                                            if escapeSafe then
-                                                microTeleport(escapeSafe)
-                                                lastDodgeTime = tick()
-                                            end
-                                        end
-                                    end
-                                end
-                            else
-                                -- APPROACHING: use MoveTo (smoother, less suspicious)
-                                requestMove("dodge", safePos, 0.3)
-                                lastDodgeTime = tick()
-                                consecutiveDodges = consecutiveDodges + 1
-                            end
-                        end
-                    else
-                        -- position is safe right now
-                        clearMove("dodge")
-
-                        -- RETURN TO ANCHOR: drift back to pre-dodge position if we have one
-                        if dodgeAnchor and consecutiveDodges > 0 then
-                            local anchorDist = flatDist(playerPos, dodgeAnchor)
-                            if anchorDist > 2 and anchorDist <= C.MaxTpDist * 2 then
-                                -- lerp toward anchor gently
-                                local lerpedPos = playerPos:Lerp(dodgeAnchor, C.ReturnDrift)
-                                -- only return if the anchor itself is still safe
-                                local anchorThreats = collectThreats(lerpedPos)
-                                local anchorSafe = #anchorThreats == 0 or isPositionSafe(lerpedPos, playerPos.Y, anchorThreats, C.ThreatLookahead)
-                                if anchorSafe then
-                                    requestMove("hold", lerpedPos, 0.2)
-                                end
-                            end
-                            -- clear anchor after returning close enough or if it's stale
-                            if anchorDist <= 2 or (tick() - anchorSetAt > C.AnchorMaxAge) then
-                                dodgeAnchor = nil
-                                consecutiveDodges = 0
-                            end
-                        else
-                            dodgeAnchor = nil
-                            consecutiveDodges = 0
-                        end
-                    end
-                else
-                    clearMove("dodge")
-                    -- no threats at all — clear anchor
-                    if dodgeAnchor then
-                        local anchorDist = flatDist(playerPos, dodgeAnchor)
-                        if anchorDist > 2 and consecutiveDodges > 0 then
-                            requestMove("hold", dodgeAnchor, 0.2)
-                        end
-                        dodgeAnchor = nil
-                        consecutiveDodges = 0
-                    end
-                end
-            end
+    -- pick a clear spot: preferred side, else mirror, else minimal snap along the dir
+    DODGE.active = true
+    local off = best.need
+    local candidate = pp + best.dir * off
+    local viaTp = false
+    if not clearPath(pp, candidate) then
+        local mirror = pp - best.dir * off
+        if clearPath(pp, mirror) then
+            candidate = mirror
+        else
+            candidate = pp + best.dir * math.min(off, C.MaxTpDist)
+            viaTp = true  -- surrounded — will need the snap
         end
-        task.wait(0.06) -- ~16Hz for split-second reactions
+    end
+
+    local hum = getHum()
+    local walkReach = (hum and hum.WalkSpeed or 16) * best.t
+
+    bc.threat  = best.name
+    bc.predict = string.format("impact ~%.2fs", best.t)
+    bc.target  = string.format("%.0f, %.0f", candidate.X, candidate.Z)
+
+    if (best.t <= C.TpReactTime and off > walkReach) or viaTp then
+        microTeleport(candidate)
+        requestMove("dodge", candidate, 0.1)   -- re-arm movement same frame → no freeze
+        bc.action = "MICRO-TP"
+        bc.reason = viaTp and "boxed in" or "impact imminent, walk too slow"
+    else
+        requestMove("dodge", candidate, 0.15)  -- short TTL so it releases the moment we're clear
+        bc.action = "DODGE"
+        bc.reason = string.format("step %.1f studs aside", off)
     end
 end)
 
 -- ============================================================
--- [v8] MAIN FARM LOOP — stand-and-fight with smart targeting
+-- DEBRIS CLEAR (optional, off by default) — small loose props only
+-- ============================================================
+task.spawn(function()
+    while running do
+        if C.ClearDebris then
+            local hrp = getHRP()
+            if hrp then
+                local pp = hrp.Position
+                for _, d in workspace:GetChildren() do
+                    if d:IsA("BasePart") and d.CanCollide then
+                        local sz = d.Size
+                        if sz.X < 5 and sz.Y < 5 and sz.Z < 5 then
+                            if (d.Position - pp).Magnitude < C.DodgeRange then
+                                d.CanCollide = false
+                                d.Transparency = 1
+                            end
+                        end
+                    end
+                end
+            end
+        end
+        task.wait(1)
+    end
+end)
+
+-- ============================================================
+-- MAIN FARM LOOP — stand-and-fight (no post-dodge wait)
 -- ============================================================
 task.spawn(function()
     while running do
         if not isAlive() then
             waitAlive()
             currentTarget = nil
+            DODGE.baseAction = "dead"
             task.wait(1)
         else
             local hum = getHum()
             local hrp = getHRP()
             if not hum or not hrp then task.wait(0.5) continue end
 
-            -- recently dodged? wait a beat before repositioning
-            if tick() - lastDodgeTime < C.SafeReturnTime then
-                task.wait(0.1)
-                continue
-            end
-
             local enemy, d = selectTarget()
 
             if enemy and enemy:FindFirstChild("HumanoidRootPart") then
                 local ePos = enemy.HumanoidRootPart.Position
-
                 if d <= C.FarmDist then
-                    -- COMBAT RANGE: stand and fight
-                    -- hold position — only adjust if too close or too far from hold distance
+                    DODGE.baseAction = "attacking"
                     local diff = d - C.HoldDist
                     if math.abs(diff) > 4 then
-                        -- nudge toward/away from enemy to maintain hold distance
                         local dir = (hrp.Position - ePos)
                         local flatDir = Vector3.new(dir.X, 0, dir.Z)
                         if flatDir.Magnitude > 0.1 then
-                            local holdPos = ePos + flatDir.Unit * C.HoldDist
-                            requestMove("hold", holdPos, 0.2)
+                            requestMove("hold", ePos + flatDir.Unit * C.HoldDist, 0.2)
                         end
                     end
-                    -- else: stay put, let kill aura + abilities do the work
-                    task.wait(0.2)
-
+                    task.wait(0.15)
                 elseif d <= C.DetectRadius then
-                    -- DETECTION RANGE: enemy is aggroed and approaching, hold position
-                    -- only move if enemy is too far to engage but within detection
-                    -- let the enemy come to us, but nudge slightly closer if it's taking too long
+                    DODGE.baseAction = "approaching"
                     if d > C.FarmDist + 10 then
-                        -- gentle approach: move to a point that's HoldDist from enemy
                         local dir = (ePos - hrp.Position)
                         local flatDir = Vector3.new(dir.X, 0, dir.Z)
                         if flatDir.Magnitude > 0.1 then
-                            local approachPos = ePos - flatDir.Unit * C.HoldDist
-                            requestMove("path", approachPos, 0.3)
+                            requestMove("path", ePos - flatDir.Unit * C.HoldDist, 0.3)
                         end
                     end
-                    task.wait(0.25)
-
+                    task.wait(0.2)
                 else
-                    -- FAR AWAY: pathfind to next enemy cluster
+                    DODGE.baseAction = "pathing"
                     pathTo(enemy, nil)
                 end
             else
-                -- no enemies — find next room
                 currentTarget = nil
+                DODGE.baseAction = "seeking room"
                 local target = nextRoomPos()
-                if target then
-                    pathTo(nil, target)
-                else
-                    task.wait(1)
-                end
+                if target then pathTo(nil, target) else task.wait(1) end
             end
         end
-        task.wait(0.15)
+        task.wait(0.1)
     end
 end)
 
@@ -1484,7 +1265,62 @@ task.spawn(function()
 end)
 
 -- ============================================================
-print("[ZF8] ZeroFarm v8 Active — Cascade UI")
+-- DEBUG BREADCRUMBS HUD
+-- ============================================================
+local dbgGui, dbgLabel
+local function buildDebug()
+    dbgGui = Instance.new("ScreenGui")
+    dbgGui.Name = "ZF_Debug"
+    dbgGui.ResetOnSpawn = false
+    dbgGui.IgnoreGuiInset = true
+    dbgGui.DisplayOrder = 999999
+    local ok = pcall(function()
+        dbgGui.Parent = (gethui and gethui()) or game:GetService("CoreGui")
+    end)
+    if not ok then dbgGui.Parent = lp():WaitForChild("PlayerGui") end
+
+    local frame = Instance.new("Frame")
+    frame.Size = UDim2.fromOffset(300, 128)
+    frame.Position = UDim2.fromOffset(14, 14)
+    frame.BackgroundColor3 = Color3.fromRGB(14, 15, 18)
+    frame.BackgroundTransparency = 0.2
+    frame.BorderSizePixel = 0
+    frame.Parent = dbgGui
+    local corner = Instance.new("UICorner"); corner.CornerRadius = UDim.new(0, 8); corner.Parent = frame
+    local stroke = Instance.new("UIStroke"); stroke.Color = Color3.fromRGB(60, 130, 90); stroke.Transparency = 0.4; stroke.Parent = frame
+
+    dbgLabel = Instance.new("TextLabel")
+    dbgLabel.Size = UDim2.new(1, -16, 1, -12)
+    dbgLabel.Position = UDim2.fromOffset(8, 6)
+    dbgLabel.BackgroundTransparency = 1
+    dbgLabel.Font = Enum.Font.Code
+    dbgLabel.TextSize = 13
+    dbgLabel.TextXAlignment = Enum.TextXAlignment.Left
+    dbgLabel.TextYAlignment = Enum.TextYAlignment.Top
+    dbgLabel.TextColor3 = Color3.fromRGB(125, 232, 150)
+    dbgLabel.RichText = true
+    dbgLabel.Text = ""
+    dbgLabel.Parent = frame
+end
+pcall(buildDebug)
+
+local dbgAccum = 0
+conns.dbg = RunS.Heartbeat:Connect(function(dt)
+    if not running or not dbgGui then return end
+    dbgGui.Enabled = C.Debug
+    if not C.Debug then return end
+    dbgAccum = dbgAccum + dt
+    if dbgAccum < 0.1 then return end
+    dbgAccum = 0
+    local b = DODGE.breadcrumb
+    dbgLabel.Text = string.format(
+        "<b>ZF8.1 DODGE HUD</b>\nAction : <font color=\"#FFD166\">%s</font>\nThreat : %s\nPredict: %s\nTarget : %s\nReason : %s",
+        b.action, b.threat, b.predict, b.target, b.reason
+    )
+end)
+
+-- ============================================================
+print("[ZF8] ZeroFarm v8.1 Active — Cascade UI + Debug HUD")
 
 _G.StopZF = function()
     running = false
@@ -1493,7 +1329,6 @@ _G.StopZF = function()
     end
     if speedConn then speedConn:Disconnect() end
     if noclipConn then noclipConn:Disconnect(); noclipConn = nil end
-    -- restore collision on stop
     local char = getChar()
     if char then
         for _, p in char:GetDescendants() do
@@ -1501,6 +1336,7 @@ _G.StopZF = function()
         end
     end
     if gyro then pcall(function() gyro:Destroy() end) end
+    if dbgGui then pcall(function() dbgGui:Destroy() end) end
     local hum = getHum()
     if hum then hum.WalkSpeed = 16 end
     if app then pcall(function() app:Destroy() end) end
