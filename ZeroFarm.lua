@@ -370,6 +370,23 @@ local function flatDist(a, b)
     return math.sqrt(dx * dx + dz * dz)
 end
 
+-- Raycast a straight line; true if no solid wall blocks it (used for line-of-sight and
+-- dodge-cell reachability). Ignores non-collidable effects and enemy models.
+local rayParams = RaycastParams.new()
+rayParams.FilterType = Enum.RaycastFilterType.Exclude
+local function clearPath(fromPos, toPos)
+    local char = getChar()
+    rayParams.FilterDescendantsInstances = char and { char } or {}
+    local dir = toPos - fromPos
+    if dir.Magnitude < 0.1 then return true end
+    local res = workspace:Raycast(fromPos, dir, rayParams)
+    if not res then return true end
+    if not res.Instance.CanCollide then return true end       -- effects/props aren't walls
+    local m = res.Instance:FindFirstAncestorWhichIsA("Model")
+    if m and m:FindFirstChild("Humanoid") then return true end -- enemies aren't walls
+    return false
+end
+
 -- Shared dodge/AI state (declared early so CharacterAdded handlers can reset it)
 local DODGE = {
     active     = false,
@@ -535,15 +552,20 @@ local function nearest()
     return best, bestD
 end
 
-local function hasNearbyEnemies()
+-- Should we STOP travelling and fight? Only when an enemy is actually reachable — in kill
+-- range, or within detect range WITH clear line of sight. An enemy behind a wall (e.g. the
+-- one we're pathfinding toward) must NOT trigger this, or pathing would abort instantly.
+local function shouldEngage()
     local hrp = getHRP()
     if not hrp then return false end
     local pos = hrp.Position
     for _, e in getAllEnemies() do
-        local ok, d = pcall(function()
-            return (pos - e.HumanoidRootPart.Position).Magnitude
-        end)
-        if ok and d <= C.DetectRadius then return true end
+        local ehrp = e:FindFirstChild("HumanoidRootPart")
+        if ehrp then
+            local d = (pos - ehrp.Position).Magnitude
+            if d <= C.FarmDist then return true end
+            if d <= C.DetectRadius and clearPath(pos, ehrp.Position) then return true end
+        end
     end
     return false
 end
@@ -575,7 +597,7 @@ local function followPath(path, targetModel, goalPos)
 
     for _, wp in ipairs(waypoints) do
         if not running then return exit("stopped") end
-        if hasNearbyEnemies() then return exit("engage") end
+        if shouldEngage() then return exit("engage") end
 
         if targetModel then
             if not targetModel.Parent or not targetModel:FindFirstChild("Humanoid") or targetModel.Humanoid.Health <= 0 then
@@ -599,7 +621,7 @@ local function followPath(path, targetModel, goalPos)
             if not hrp then break end
             if (hrp.Position - wp.Position).Magnitude < C.ArriveRadius then break end
             if tick() - t0 > C.MoveTimeout then break end
-            if hasNearbyEnemies() then return exit("engage") end
+            if shouldEngage() then return exit("engage") end
             requestMove("path", wp.Position, 0.25)
             task.wait(0.1)
         end
@@ -1059,22 +1081,6 @@ end)
 -- DODGE SYSTEM  [v8.1]  — predict, step minimally, never freeze
 -- ============================================================
 
--- Raycast the straight line to a candidate dodge spot; true if no solid wall blocks it.
-local rayParams = RaycastParams.new()
-rayParams.FilterType = Enum.RaycastFilterType.Exclude
-local function clearPath(fromPos, toPos)
-    local char = getChar()
-    rayParams.FilterDescendantsInstances = char and { char } or {}
-    local dir = toPos - fromPos
-    if dir.Magnitude < 0.1 then return true end
-    local res = workspace:Raycast(fromPos, dir, rayParams)
-    if not res then return true end
-    if not res.Instance.CanCollide then return true end       -- effects/props aren't walls
-    local m = res.Instance:FindFirstAncestorWhichIsA("Model")
-    if m and m:FindFirstChild("Humanoid") then return true end -- enemies aren't walls
-    return false
-end
-
 -- Rare last-resort snap. Hard rate-limited: writing HRP.CFrame interrupts Humanoid
 -- walking, so this must NOT fire every frame or the character stutters in place and
 -- never walks out. Returns true only when it actually teleported.
@@ -1269,6 +1275,7 @@ task.spawn(function()
             if enemy and enemy:FindFirstChild("HumanoidRootPart") then
                 local ePos = enemy.HumanoidRootPart.Position
                 if d <= C.FarmDist then
+                    -- combat range: hold/strafe near the enemy (open ground, beeline is fine)
                     DODGE.baseAction = "attacking"
                     local diff = d - C.HoldDist
                     if math.abs(diff) > 4 then
@@ -1279,17 +1286,17 @@ task.spawn(function()
                         end
                     end
                     task.wait(0.15)
-                elseif d <= C.DetectRadius then
+                elseif clearPath(hrp.Position, ePos) then
+                    -- clear line of sight: beeline straight at the enemy (fast, smooth)
                     DODGE.baseAction = "approaching"
-                    if d > C.FarmDist + 10 then
-                        local dir = (ePos - hrp.Position)
-                        local flatDir = Vector3.new(dir.X, 0, dir.Z)
-                        if flatDir.Magnitude > 0.1 then
-                            requestMove("path", ePos - flatDir.Unit * C.HoldDist, 0.3)
-                        end
+                    local dir = (ePos - hrp.Position)
+                    local flatDir = Vector3.new(dir.X, 0, dir.Z)
+                    if flatDir.Magnitude > 0.1 then
+                        requestMove("path", ePos - flatDir.Unit * C.HoldDist, 0.3)
                     end
-                    task.wait(0.2)
+                    task.wait(0.15)
                 else
+                    -- enemy behind cover / around a corner: PathfindingService around walls
                     DODGE.baseAction = "pathing"
                     pathTo(enemy, nil)
                 end
