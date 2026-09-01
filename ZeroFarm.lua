@@ -973,41 +973,8 @@ end)
 local threats = {}      -- [BasePart] = true
 local threatData = {}    -- [BasePart] = { lastPos, velocity, telegraph }
 
--- Generic/default instance names that also appear inside player & enemy CHARACTERS
--- (armor, accessories, meshes). These must NEVER be used as projectile identifiers or
--- the player's own armor gets flagged as a threat.
-local GENERIC_NAME = {
-    Model=true, Folder=true, Part=true, MeshPart=true, Union=true, UnionOperation=true,
-    Wedge=true, WedgePart=true, Handle=true, ArmorMesh=true, newPart=true, Mesh=true,
-    Bone=true, Head=true, Torso=true, Accessory=true, Hat=true, Accoutrement=true,
-}
-
--- Detection is scoped ENTIRELY to ReplicatedStorage.enemyProjectiles: an instance in
--- workspace is only a threat if it was cloned from that folder. PROJ_NAMES = attack
--- models/folders; PROJ_PART_NAMES = attacks that are cloned as a single loose Part.
--- Generic names are excluded so armor/accessory sub-models can't match.
-local PROJ_NAMES, PROJ_PART_NAMES = {}, {}
-do
-    local ep = Rep:FindFirstChild("enemyProjectiles")
-    if ep then
-        for _, m in ep:GetChildren() do
-            if (m:IsA("Model") or m:IsA("Folder")) and not GENERIC_NAME[m.Name] then
-                PROJ_NAMES[m.Name] = true
-            elseif m:IsA("BasePart") and not GENERIC_NAME[m.Name] then
-                PROJ_PART_NAMES[m.Name] = true
-            end
-        end
-        for _, m in ep:GetDescendants() do
-            if (m:IsA("Model") or m:IsA("Folder")) and not GENERIC_NAME[m.Name] then
-                PROJ_NAMES[m.Name] = true
-            end
-        end
-        PROJ_NAMES[ep.Name] = nil
-    end
-end
-
 -- True if `inst` lives inside any character (a Model with a Humanoid) — player or enemy.
--- Used to exclude armor/body parts, which are never projectiles.
+-- Used to exclude armor/body parts, which are never attacks.
 local function inCharacter(inst)
     local m = inst:FindFirstAncestorWhichIsA("Model")
     while m do
@@ -1017,48 +984,42 @@ local function inCharacter(inst)
     return false
 end
 
--- Register a projectile's damage parts. Prefer hitBox/precast; if it has none (beams,
--- bombs, geysers, crescents, rockets — ~79 of the attack models), fall back to the visible
--- danger geometry. Catches BOTH anchored beams/AoEs AND unanchored physics projectiles,
--- with no size cap (a boss beam can be 150+ studs long).
-local function scanProjectile(inst)
-    if not inst.Parent then return end
-    if inCharacter(inst) then return end  -- armor/body sub-model, not an attack
-    local hasNamed = false
-    for _, d in inst:GetDescendants() do
-        if d:IsA("BasePart") and (d.Name == "hitBox" or d.Name == "precast") then
-            threats[d] = true; hasNamed = true
-        end
+-- Names of the player's OWN spell projectiles (ReplicatedStorage.projectiles), so we never
+-- dodge our own casts (Fireball's "Soul Drain", etc. spawn into workspace when we cast).
+local PLAYER_PROJ = {}
+do
+    local proj = Rep:FindFirstChild("projectiles")
+    if proj then for _, m in proj:GetChildren() do PLAYER_PROJ[m.Name] = true end end
+end
+local function isPlayerProjectile(inst)
+    if PLAYER_PROJ[inst.Name] then return true end
+    local m = inst:FindFirstAncestorWhichIsA("Model")
+    while m do
+        if PLAYER_PROJ[m.Name] then return true end
+        m = m:FindFirstAncestorWhichIsA("Model")
     end
-    if hasNamed then return end
-    for _, d in inst:GetDescendants() do
-        if d:IsA("BasePart") and not d.CanCollide then
-            local mx = math.max(d.Size.X, d.Size.Y, d.Size.Z)
-            if (d.Material == Enum.Material.Neon and mx >= 2)
-               or (d.Transparency < 1 and mx >= 3) then
-                threats[d] = true
-            end
-        end
-    end
+    return false
 end
 
+-- DETECTION: treat any NEW non-collidable part that appears in workspace as a potential
+-- threat. Boss attacks (from mapSpecificLocals, EnemyClientEffects, or anywhere) are always
+-- non-collidable parts spawned into workspace during the fight; walls/floors/props are
+-- collidable, and character armor/bodies + our own spell projectiles are excluded. This is
+-- intentionally broad — the OBB grid dodge only actually MOVES when the player is inside a
+-- part's box, so harmless distant parts are tracked but never trigger a dodge. Parts are
+-- auto-untracked when destroyed. We do NOT seed pre-existing parts (only new spawns count).
 conns.ptAdd = workspace.DescendantAdded:Connect(function(d)
-    if d:IsA("BasePart") then
-        -- a loose attack part cloned straight from enemyProjectiles (never inside a character)
-        if PROJ_PART_NAMES[d.Name] and not inCharacter(d) then threats[d] = true end
-    elseif (d:IsA("Model") or d:IsA("Folder")) and PROJ_NAMES[d.Name] then
-        task.defer(scanProjectile, d)  -- defer so all descendants are parented
+    if d:IsA("BasePart") and not d.CanCollide and not inCharacter(d) and not isPlayerProjectile(d) then
+        local sz = d.Size
+        if math.max(sz.X, sz.Y, sz.Z) >= 1 then  -- skip tiny particle/fx bits
+            threats[d] = true
+        end
     end
 end)
 conns.ptRem = workspace.DescendantRemoving:Connect(function(d)
     threats[d] = nil
     threatData[d] = nil
 end)
-
--- NOTE: we deliberately do NOT seed any pre-existing parts as threats. Real boss
--- attacks are Clone()'d into workspace during the fight and caught by DescendantAdded.
--- Pre-existing hitBox/precast parts are dormant enemy/decor hitboxes (the lobby alone
--- has ~50), never live projectiles — seeding them causes constant phantom dodging.
 
 -- estimate velocity of CFrame-animated projectiles from position deltas
 conns.threatTrack = RunS.Heartbeat:Connect(function(dt)
@@ -1393,7 +1354,7 @@ conns.dbg = RunS.Heartbeat:Connect(function(dt)
 end)
 
 -- ============================================================
-print("[ZF8] ZeroFarm v8.8 Active — armor-safe detection + ranged spellcasting")
+print("[ZF8] ZeroFarm v9.0 Active — dodges any new workspace hazard part")
 
 _G.StopZF = function()
     running = false
