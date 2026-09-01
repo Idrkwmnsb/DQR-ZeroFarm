@@ -973,22 +973,48 @@ end)
 local threats = {}      -- [BasePart] = true
 local threatData = {}    -- [BasePart] = { lastPos, velocity, telegraph }
 
+-- Generic/default instance names that also appear inside player & enemy CHARACTERS
+-- (armor, accessories, meshes). These must NEVER be used as projectile identifiers or
+-- the player's own armor gets flagged as a threat.
+local GENERIC_NAME = {
+    Model=true, Folder=true, Part=true, MeshPart=true, Union=true, UnionOperation=true,
+    Wedge=true, WedgePart=true, Handle=true, ArmorMesh=true, newPart=true, Mesh=true,
+    Bone=true, Head=true, Torso=true, Accessory=true, Hat=true, Accoutrement=true,
+}
+
 -- Detection is scoped ENTIRELY to ReplicatedStorage.enemyProjectiles: an instance in
 -- workspace is only a threat if it was cloned from that folder. PROJ_NAMES = attack
 -- models/folders; PROJ_PART_NAMES = attacks that are cloned as a single loose Part.
+-- Generic names are excluded so armor/accessory sub-models can't match.
 local PROJ_NAMES, PROJ_PART_NAMES = {}, {}
 do
     local ep = Rep:FindFirstChild("enemyProjectiles")
     if ep then
         for _, m in ep:GetChildren() do
-            if m:IsA("Model") or m:IsA("Folder") then PROJ_NAMES[m.Name] = true
-            elseif m:IsA("BasePart") then PROJ_PART_NAMES[m.Name] = true end
+            if (m:IsA("Model") or m:IsA("Folder")) and not GENERIC_NAME[m.Name] then
+                PROJ_NAMES[m.Name] = true
+            elseif m:IsA("BasePart") and not GENERIC_NAME[m.Name] then
+                PROJ_PART_NAMES[m.Name] = true
+            end
         end
         for _, m in ep:GetDescendants() do
-            if m:IsA("Model") or m:IsA("Folder") then PROJ_NAMES[m.Name] = true end
+            if (m:IsA("Model") or m:IsA("Folder")) and not GENERIC_NAME[m.Name] then
+                PROJ_NAMES[m.Name] = true
+            end
         end
         PROJ_NAMES[ep.Name] = nil
     end
+end
+
+-- True if `inst` lives inside any character (a Model with a Humanoid) — player or enemy.
+-- Used to exclude armor/body parts, which are never projectiles.
+local function inCharacter(inst)
+    local m = inst:FindFirstAncestorWhichIsA("Model")
+    while m do
+        if m:FindFirstChildOfClass("Humanoid") then return true end
+        m = m:FindFirstAncestorWhichIsA("Model")
+    end
+    return false
 end
 
 -- Register a projectile's damage parts. Prefer hitBox/precast; if it has none (beams,
@@ -997,7 +1023,7 @@ end
 -- with no size cap (a boss beam can be 150+ studs long).
 local function scanProjectile(inst)
     if not inst.Parent then return end
-    if inst:FindFirstChild("Humanoid") then return end  -- not an enemy/player
+    if inCharacter(inst) then return end  -- armor/body sub-model, not an attack
     local hasNamed = false
     for _, d in inst:GetDescendants() do
         if d:IsA("BasePart") and (d.Name == "hitBox" or d.Name == "precast") then
@@ -1018,11 +1044,8 @@ end
 
 conns.ptAdd = workspace.DescendantAdded:Connect(function(d)
     if d:IsA("BasePart") then
-        -- a loose attack part cloned straight from enemyProjectiles (not inside an enemy)
-        if PROJ_PART_NAMES[d.Name] then
-            local m = d:FindFirstAncestorWhichIsA("Model")
-            if not (m and m:FindFirstChild("Humanoid")) then threats[d] = true end
-        end
+        -- a loose attack part cloned straight from enemyProjectiles (never inside a character)
+        if PROJ_PART_NAMES[d.Name] and not inCharacter(d) then threats[d] = true end
     elseif (d:IsA("Model") or d:IsA("Folder")) and PROJ_NAMES[d.Name] then
         task.defer(scanProjectile, d)  -- defer so all descendants are parented
     end
@@ -1370,7 +1393,7 @@ conns.dbg = RunS.Heartbeat:Connect(function(dt)
 end)
 
 -- ============================================================
-print("[ZF8] ZeroFarm v8.7 Active — enemyProjectiles-only dodge + ranged spellcasting")
+print("[ZF8] ZeroFarm v8.8 Active — armor-safe detection + ranged spellcasting")
 
 _G.StopZF = function()
     running = false
