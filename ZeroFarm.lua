@@ -39,7 +39,10 @@ local C = {
     TargetEscape = 14,
     LeadTime     = 0.35,
     DetectRadius = 60,
-    HoldDist     = 12,
+    -- engagement ranges (spell build: fight from range, don't hug the boss)
+    SpellRange   = 85,   -- cast Q/E from this far (spells are ranged, server aims by facing)
+    EngageDist   = 42,   -- stop approaching and hold at this range
+    HoldDist     = 30,   -- preferred standoff distance from the enemy while fighting
     -- dodge tuning
     ThreatBuffer    = 2.5,  -- extra studs added to each threat's radius
     DodgeMargin     = 2.5,  -- clearance beyond the danger radius when stepping aside
@@ -167,14 +170,14 @@ do -- Combat tab
 
     do
         local row = form:Row({ SearchIndex = "Hold Distance" })
-        row:Left():TitleStack({ Title = "Hold Distance", Subtitle = "Preferred standoff distance from aggroed enemy (studs)." })
+        row:Left():TitleStack({ Title = "Hold Distance", Subtitle = "Standoff distance while fighting (higher = safer, ranged)." })
         row:Right():Stepper({
             Fielded = true,
             Value = C.HoldDist,
-            Min = 3,
-            Max = 30,
+            Min = 5,
+            Max = 70,
             Increment = 1,
-            ValueChanged = function(_, v) C.HoldDist = math.clamp(v, 3, 30) end,
+            ValueChanged = function(_, v) C.HoldDist = math.clamp(v, 5, 70) end,
         })
     end
 end
@@ -935,14 +938,19 @@ end
 task.spawn(function()
     while running do
         if C.AutoAbility and isAlive() then
-            local _, d = nearest()
-            if d <= C.FarmDist + 15 then
+            local enemy, d = nearest()
+            local hrp = getHRP()
+            -- Spells are ranged (the server aims them along the character's facing, which the
+            -- BodyGyro locks onto the enemy). Cast from far as long as we have line of sight —
+            -- no need to walk into the boss. This is the fix for "spells only fire up close".
+            local ehrp = enemy and enemy:FindFirstChild("HumanoidRootPart")
+            if d <= C.SpellRange and hrp and ehrp and clearPath(hrp.Position, ehrp.Position) then
                 castAbility("q")
                 task.wait(C.AbilityCD)
                 castAbility("e")
             end
         end
-        task.wait(0.5 + math.random() * 0.3)
+        task.wait(0.4 + math.random() * 0.2)
     end
 end)
 
@@ -962,32 +970,22 @@ end)
 -- ============================================================
 -- THREAT TRACKER — velocity-estimating projectile awareness
 -- ============================================================
-local DANGER = {
-    hitbox=1, hitBox=1, damagepart=1, damagePart=1, trappart=1, trapPart=1,
-    lavaline=1, lavaLine=1, groundflame=1, groundFlame=1,
-    flamecyclone=1, flameCyclone=1, iceradius=1, iceRadius=1,
-    memorydamagezone=1, memoryDamageZone=1,
-    charmark=1, charMark=1, cubepylon=1, cubePylon=1,
-    electrictower=1, electricTower=1, freezeplayerpart=1, freezePlayerPart=1,
-    precast=1, flamelash=1, flameLash=1, sweepingflame=1, sweepingFlame=1,
-    longline=1, longLine=1, spreadline=1, spreadLine=1,
-    lineshot=1, lineShot=1, circlehit=1, circleHit=1,
-    shurikenhit=1, shurikenHit=1, hammerbothit=1, hammerBotHit=1,
-    flamingshuriken=1, flamingShuriken=1,
-    damageArea=1, wave=1, sword=1,
-}
-
 local threats = {}      -- [BasePart] = true
-local threatData = {}    -- [BasePart] = { lastPos, velocity, radius, telegraph }
+local threatData = {}    -- [BasePart] = { lastPos, velocity, telegraph }
 
--- Names of every attack container inside ReplicatedStorage.enemyProjectiles, so we can
--- catch attacks whose damage parts AREN'T named hitBox/precast (beams, ice spikes, etc.).
-local PROJ_NAMES = {}
+-- Detection is scoped ENTIRELY to ReplicatedStorage.enemyProjectiles: an instance in
+-- workspace is only a threat if it was cloned from that folder. PROJ_NAMES = attack
+-- models/folders; PROJ_PART_NAMES = attacks that are cloned as a single loose Part.
+local PROJ_NAMES, PROJ_PART_NAMES = {}, {}
 do
     local ep = Rep:FindFirstChild("enemyProjectiles")
     if ep then
+        for _, m in ep:GetChildren() do
+            if m:IsA("Model") or m:IsA("Folder") then PROJ_NAMES[m.Name] = true
+            elseif m:IsA("BasePart") then PROJ_PART_NAMES[m.Name] = true end
+        end
         for _, m in ep:GetDescendants() do
-            if (m:IsA("Model") or m:IsA("Folder")) then PROJ_NAMES[m.Name] = true end
+            if m:IsA("Model") or m:IsA("Folder") then PROJ_NAMES[m.Name] = true end
         end
         PROJ_NAMES[ep.Name] = nil
     end
@@ -995,8 +993,8 @@ end
 
 -- Register a projectile's damage parts. Prefer hitBox/precast; if it has none (beams,
 -- bombs, geysers, crescents, rockets — ~79 of the attack models), fall back to the visible
--- danger geometry. Must catch BOTH anchored beams/AoEs AND unanchored physics projectiles,
--- and NOT cap size (a boss beam can be 150+ studs long).
+-- danger geometry. Catches BOTH anchored beams/AoEs AND unanchored physics projectiles,
+-- with no size cap (a boss beam can be 150+ studs long).
 local function scanProjectile(inst)
     if not inst.Parent then return end
     if inst:FindFirstChild("Humanoid") then return end  -- not an enemy/player
@@ -1010,8 +1008,6 @@ local function scanProjectile(inst)
     for _, d in inst:GetDescendants() do
         if d:IsA("BasePart") and not d.CanCollide then
             local mx = math.max(d.Size.X, d.Size.Y, d.Size.Z)
-            -- Neon = telegraph/beam/AoE visual (any size); or any visible solid part big
-            -- enough to be a projectile body. Skip invisible anchor parts and tiny fx bits.
             if (d.Material == Enum.Material.Neon and mx >= 2)
                or (d.Transparency < 1 and mx >= 3) then
                 threats[d] = true
@@ -1022,9 +1018,8 @@ end
 
 conns.ptAdd = workspace.DescendantAdded:Connect(function(d)
     if d:IsA("BasePart") then
-        if DANGER[d.Name] then
-            -- skip a dormant enemy's own persistent body hitBox (not an attack); real
-            -- attack hitBoxes live inside cloned projectile models (no Humanoid ancestor)
+        -- a loose attack part cloned straight from enemyProjectiles (not inside an enemy)
+        if PROJ_PART_NAMES[d.Name] then
             local m = d:FindFirstAncestorWhichIsA("Model")
             if not (m and m:FindFirstChild("Humanoid")) then threats[d] = true end
         end
@@ -1266,9 +1261,11 @@ task.spawn(function()
 
             if enemy and enemy:FindFirstChild("HumanoidRootPart") then
                 local ePos = enemy.HumanoidRootPart.Position
-                if d <= C.FarmDist then
-                    -- combat range: hold/strafe near the enemy (open ground, beeline is fine)
-                    DODGE.baseAction = "attacking"
+                if d <= C.EngageDist then
+                    -- engage range: hold at HoldDist and let ranged spells do the work. Do NOT
+                    -- walk into the boss — maintain the standoff distance (in or out) so we stay
+                    -- out of melee/close-AoE range while still casting.
+                    DODGE.baseAction = "fighting"
                     local diff = d - C.HoldDist
                     if math.abs(diff) > 4 then
                         local dir = (hrp.Position - ePos)
@@ -1279,7 +1276,8 @@ task.spawn(function()
                     end
                     task.wait(0.15)
                 elseif clearPath(hrp.Position, ePos) then
-                    -- clear line of sight: beeline straight at the enemy (fast, smooth)
+                    -- clear line of sight: approach only until we reach HoldDist (spells already
+                    -- firing from SpellRange while we close the gap)
                     DODGE.baseAction = "approaching"
                     local dir = (ePos - hrp.Position)
                     local flatDir = Vector3.new(dir.X, 0, dir.Z)
@@ -1372,7 +1370,7 @@ conns.dbg = RunS.Heartbeat:Connect(function(dt)
 end)
 
 -- ============================================================
-print("[ZF8] ZeroFarm v8.6 Active — OBB Grid Dodge (walk-to-safe, no flee) + Debug HUD")
+print("[ZF8] ZeroFarm v8.7 Active — enemyProjectiles-only dodge + ranged spellcasting")
 
 _G.StopZF = function()
     running = false
