@@ -42,11 +42,11 @@ local C = {
     HoldDist     = 12,
     -- dodge tuning
     ThreatBuffer    = 2.5,  -- extra studs added to each threat's radius
-    DodgeMargin     = 2,    -- clearance beyond the danger radius when stepping aside
-    ThreatLookahead = 0.8,  -- seconds ahead to predict incoming projectiles
-    MaxTpDist       = 6,    -- last-resort micro-teleport cap (studs) — small on purpose
-    TpReactTime     = 0.12, -- impact sooner than this + walk can't reach = micro-TP
-    DodgeMax        = 14,   -- never step further than this in one dodge (studs)
+    DodgeMargin     = 2.5,  -- clearance beyond the danger radius when stepping aside
+    ThreatLookahead = 1.0,  -- seconds ahead to predict incoming projectiles
+    MaxTpDist       = 7,    -- per-frame micro-teleport cap (studs) — small on purpose
+    TpReactTime     = 0.08, -- only TP when impact is this imminent and inside a hitBox
+    DodgeMax        = 24,   -- max escape step target (studs) — big enough to clear large AoEs
 }
 _G.ZF = C
 
@@ -971,27 +971,57 @@ local function isPrecastZone(part)
 end
 
 local threats = {}      -- [BasePart] = true
-local threatData = {}    -- [BasePart] = { lastPos, velocity, radius }
+local threatData = {}    -- [BasePart] = { lastPos, velocity, radius, telegraph }
+
+-- Names of every attack container inside ReplicatedStorage.enemyProjectiles, so we can
+-- catch attacks whose damage parts AREN'T named hitBox/precast (beams, ice spikes, etc.).
+local PROJ_NAMES = {}
+do
+    local ep = Rep:FindFirstChild("enemyProjectiles")
+    if ep then
+        for _, m in ep:GetDescendants() do
+            if (m:IsA("Model") or m:IsA("Folder")) then PROJ_NAMES[m.Name] = true end
+        end
+        PROJ_NAMES[ep.Name] = nil
+    end
+end
+
+-- Register a projectile's damage parts. Prefer hitBox/precast; if it has none, fall back
+-- to its anchored, non-collidable, reasonably-sized parts (the visible attack geometry).
+local function scanProjectile(inst)
+    if not inst.Parent then return end
+    if inst:FindFirstChild("Humanoid") then return end  -- not an enemy/player
+    local hasNamed = false
+    for _, d in inst:GetDescendants() do
+        if d:IsA("BasePart") and (d.Name == "hitBox" or d.Name == "precast") then
+            threats[d] = true; hasNamed = true
+        end
+    end
+    if hasNamed then return end
+    for _, d in inst:GetDescendants() do
+        if d:IsA("BasePart") and d.Anchored and not d.CanCollide then
+            local m = math.max(d.Size.X, d.Size.Y, d.Size.Z)
+            if m >= 2 and m <= 60 then threats[d] = true end
+        end
+    end
+end
 
 conns.ptAdd = workspace.DescendantAdded:Connect(function(d)
-    if not d:IsA("BasePart") then return end
-    if DANGER[d.Name] or isPrecastZone(d) then threats[d] = true end
+    if d:IsA("BasePart") then
+        if DANGER[d.Name] or isPrecastZone(d) then threats[d] = true end
+    elseif (d:IsA("Model") or d:IsA("Folder")) and PROJ_NAMES[d.Name] then
+        task.defer(scanProjectile, d)  -- defer so all descendants are parented
+    end
 end)
 conns.ptRem = workspace.DescendantRemoving:Connect(function(d)
     threats[d] = nil
     threatData[d] = nil
 end)
 
--- Init scan seeds ONLY explicitly-named danger parts. Neon "precast" zones are
--- only trusted when they spawn dynamically (via DescendantAdded) during a fight —
--- pre-existing neon is almost always harmless lobby/map decor.
-task.spawn(function()
-    for _, d in workspace:GetDescendants() do
-        if d:IsA("BasePart") and DANGER[d.Name] then
-            threats[d] = true
-        end
-    end
-end)
+-- NOTE: we deliberately do NOT seed any pre-existing parts as threats. Real boss
+-- attacks are Clone()'d into workspace during the fight and caught by DescendantAdded.
+-- Pre-existing hitBox/precast parts are dormant enemy/decor hitboxes (the lobby alone
+-- has ~50), never live projectiles — seeding them causes constant phantom dodging.
 
 -- estimate velocity of CFrame-animated projectiles from position deltas
 conns.threatTrack = RunS.Heartbeat:Connect(function(dt)
@@ -1007,6 +1037,8 @@ conns.threatTrack = RunS.Heartbeat:Connect(function(dt)
         local data = threatData[part]
         if data then
             local rawVel = (pos - data.lastPos) / dt
+            -- ignore one-frame SetPrimaryPartCFrame reposition jumps (fake velocity spikes)
+            if rawVel.Magnitude > 400 then rawVel = rawVel.Unit * 400 end
             data.velocity = data.velocity:Lerp(rawVel, 0.4)
             data.lastPos = pos
         else
@@ -1015,6 +1047,7 @@ conns.threatTrack = RunS.Heartbeat:Connect(function(dt)
                 lastPos = pos,
                 velocity = Vector3.zero,
                 radius = math.max(sz.X, sz.Y, sz.Z) * 0.5,
+                telegraph = (part.Name == "precast"),
             }
         end
     end
@@ -1059,18 +1092,21 @@ local function clearPath(fromPos, toPos)
     return false
 end
 
--- Tiny last-resort snap; capped hard at MaxTpDist, preserves facing, keeps velocity intent.
+-- Rare last-resort snap. Hard rate-limited: writing HRP.CFrame interrupts Humanoid
+-- walking, so this must NOT fire every frame or the character stutters in place and
+-- never walks out. Returns true only when it actually teleported.
 local function microTeleport(targetPos)
     local hrp = getHRP()
-    if not hrp then return end
-    if tick() - DODGE.lastTp < 0.1 then return end
+    if not hrp then return false end
+    if tick() - DODGE.lastTp < 0.3 then return false end
     local delta = targetPos - hrp.Position
     local flat = Vector3.new(delta.X, 0, delta.Z)
     local d = flat.Magnitude
-    if d < 0.3 then return end
+    if d < 0.3 then return false end
     if d > C.MaxTpDist then flat = flat.Unit * C.MaxTpDist end
     hrp.CFrame = hrp.CFrame + flat
     DODGE.lastTp = tick()
+    return true
 end
 
 -- Main dodge brain — runs every frame for ~16ms reaction, no task.wait scheduling jitter.
@@ -1125,7 +1161,14 @@ conns.dodge = RunS.Heartbeat:Connect(function()
         end
 
         if not best or tImpact < best.t then
-            best = { t = tImpact, dir = dodgeDir, need = math.min(need, C.DodgeMax), name = part.Name }
+            best = {
+                t = tImpact,
+                dir = dodgeDir,
+                need = math.min(need, C.DodgeMax),
+                name = part.Name,
+                inside = (tImpact <= 0.001),
+                telegraph = data.telegraph == true,
+            }
         end
     end
 
@@ -1136,37 +1179,44 @@ conns.dodge = RunS.Heartbeat:Connect(function()
         return
     end
 
-    -- pick a clear spot: preferred side, else mirror, else minimal snap along the dir
+    -- pick a clear spot: preferred side, else mirror side, else straight out
     DODGE.active = true
     local off = best.need
     local candidate = pp + best.dir * off
-    local viaTp = false
+    local boxedIn = false
     if not clearPath(pp, candidate) then
         local mirror = pp - best.dir * off
         if clearPath(pp, mirror) then
             candidate = mirror
         else
-            candidate = pp + best.dir * math.min(off, C.MaxTpDist)
-            viaTp = true  -- surrounded — will need the snap
+            boxedIn = true  -- both directions blocked by walls
         end
     end
 
-    local hum = getHum()
-    local walkReach = (hum and hum.WalkSpeed or 16) * best.t
-
     bc.threat  = best.name
-    bc.predict = string.format("impact ~%.2fs", best.t)
+    bc.predict = best.inside and (best.telegraph and "telegraph, exit now" or "inside hitBox!")
+                 or string.format("impact ~%.2fs", best.t)
     bc.target  = string.format("%.0f, %.0f", candidate.X, candidate.Z)
 
-    if (best.t <= C.TpReactTime and off > walkReach) or viaTp then
-        microTeleport(candidate)
-        requestMove("dodge", candidate, 0.1)   -- re-arm movement same frame → no freeze
-        bc.action = "MICRO-TP"
-        bc.reason = viaTp and "boxed in" or "impact imminent, walk too slow"
+    -- PRIMARY dodge is walking. At WalkSpeed 20 this clears a big AoE in well under a
+    -- second, and precast telegraphs give ~1s warning — so walking alone avoids most
+    -- hits. Crucially we do NOT write CFrame here; that would interrupt the walk.
+    requestMove("dodge", candidate, 0.2)
+
+    -- Micro-TP is a RARE discrete escape, hard rate-limited (0.3s) so it can't fight the
+    -- walk loop: only when a hit is genuinely imminent with no time to walk, or boxed in.
+    local imminent = best.inside and not best.telegraph and best.t <= C.TpReactTime
+    if imminent or boxedIn then
+        if microTeleport(candidate) then
+            bc.action = boxedIn and "TP (boxed in)" or "DODGE+TP"
+        else
+            bc.action = "DODGE"
+        end
+        bc.reason = string.format("escaping hit (%.0f studs out)", off)
     else
-        requestMove("dodge", candidate, 0.15)  -- short TTL so it releases the moment we're clear
         bc.action = "DODGE"
-        bc.reason = string.format("step %.1f studs aside", off)
+        bc.reason = best.telegraph and string.format("leave telegraph (%.0f studs)", off)
+                    or string.format("step %.1f studs aside", off)
     end
 end)
 
