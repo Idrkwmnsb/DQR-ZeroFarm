@@ -18,10 +18,7 @@ local C = {
     AutoDodge    = true,
     DodgeRange   = 45,
     AutoStart    = true,
-    Barriers     = true,
     NoStun       = true,
-    NerfEnemies  = true,
-    RetreatPct   = 0.4,
     AbilityCD    = 0.15,
     RepathMin    = 0.35,
     MoveTimeout  = 1.5,
@@ -42,7 +39,10 @@ local Rep = game:GetService("ReplicatedStorage")
 local UIS = game:GetService("UserInputService")
 local VirtualUser = game:GetService("VirtualUser")
 
-local player = Players.LocalPlayer
+local function lp() return Players.LocalPlayer end
+repeat task.wait(0.1) until lp()
+repeat task.wait(0.1) until lp().Character and lp().Character:FindFirstChild("Humanoid")
+
 local remotes = Rep:WaitForChild("remotes")
 local running = true
 local conns = {}
@@ -50,13 +50,18 @@ local conns = {}
 -- ============================================================
 -- CASCADE UI
 -- ============================================================
-local cascade = loadstring(game:HttpGetAsync(
-    "https://github.com/cascadeui/Cascade/releases/latest/download/dist.luau"
-), "dist.luau")()
+local cascadeOk, cascade = pcall(function()
+    return loadstring(game:HttpGetAsync(
+        "https://github.com/cascadeui/Cascade/releases/latest/download/dist.luau"
+    ), "dist.luau")()
+end)
+if not cascadeOk then warn("[ZF7] Cascade failed:", cascade); cascade = nil end
 
 local minimizeKey = Enum.KeyCode.RightControl
+local app
 
-local app = cascade.New({
+if cascade then
+app = cascade.New({
     WindowPill = true,
     Theme = cascade.Themes.Dark,
     Accent = cascade.Accents.Blue,
@@ -100,10 +105,8 @@ do -- Combat tab
     toggle(form, "Kill Aura", "Spam weaponUsed remote to hit nearby enemies.", "KillAura")
     toggle(form, "Auto Ability", "Cast Q/E abilities via Tool localEvent, respects cooldowns.", "AutoAbility")
     toggle(form, "Auto Dodge", "Sidestep left/right away from projectile hitboxes.", "AutoDodge")
-    toggle(form, "Nerf Enemies", "Set moveSpeed=0, attackSpeed=999 on enemies (client-side).", "NerfEnemies")
     toggle(form, "No Stun", "Remove stunned tag and PlatformStand.", "NoStun")
     toggle(form, "Auto Start", "Auto ready-up and start dungeons.", "AutoStart")
-    toggle(form, "Barrier Bypass", "Remove room barrier collision.", "Barriers")
 
     do
         local row = form:Row({ SearchIndex = "WalkSpeed" })
@@ -115,14 +118,6 @@ do -- Combat tab
         })
     end
 
-    do
-        local row = form:Row({ SearchIndex = "Retreat HP" })
-        row:Left():TitleStack({ Title = "Retreat HP %", Subtitle = "Flee from enemies when health drops below this." })
-        row:Right():Slider({
-            Value = C.RetreatPct,
-            ValueChanged = function(_, v) C.RetreatPct = v end,
-        })
-    end
 end
 
 do -- Movement tab
@@ -276,10 +271,12 @@ do -- Path tab
     end
 end
 
+end -- if cascade
+
 -- ============================================================
 -- HELPERS
 -- ============================================================
-local function getChar() return player.Character end
+local function getChar() local p = lp() return p and p.Character end
 local function getHRP() local c = getChar() return c and c:FindFirstChild("HumanoidRootPart") end
 local function getHum() local c = getChar() return c and c:FindFirstChild("Humanoid") end
 local function isAlive()
@@ -301,7 +298,7 @@ end
 -- ============================================================
 -- MOVEMENT ARBITER
 -- ============================================================
-local MOVE_PRIORITY = { dodge = 4, retreat = 3, orbit = 2, path = 1 }
+local MOVE_PRIORITY = { dodge = 4, orbit = 2, path = 1 }
 local intent = { owner = "none", pos = nil, untilT = 0 }
 local lastMoveSent = 0
 
@@ -551,35 +548,25 @@ local function nextRoomPos()
 end
 
 -- ============================================================
--- BARRIERS
--- ============================================================
-local function clearBarriers()
-    local dun = workspace:FindFirstChild("dungeon")
-    if not dun then return end
-    for _, room in dun:GetChildren() do
-        local b = room:FindFirstChild("barrier")
-        if b then
-            for _, p in b:GetDescendants() do
-                if p:IsA("BasePart") then p.CanCollide = false; p.Transparency = 1 end
-            end
-        end
-    end
-end
-
-task.spawn(function()
-    while running do
-        if C.Barriers then clearBarriers() end
-        task.wait(2)
-    end
-end)
-
--- ============================================================
 -- SPEED
 -- ============================================================
-conns.speed = RunS.Heartbeat:Connect(function()
-    if not running or not isAlive() then return end
+local speedConn = nil
+local function hookSpeed()
+    if speedConn then speedConn:Disconnect() end
     local hum = getHum()
-    if hum and C.Speed > 0 then hum.WalkSpeed = C.Speed end
+    if not hum then return end
+    hum.WalkSpeed = C.Speed
+    speedConn = hum:GetPropertyChangedSignal("WalkSpeed"):Connect(function()
+        if not running then return end
+        if hum.WalkSpeed ~= C.Speed then
+            hum.WalkSpeed = C.Speed
+        end
+    end)
+end
+hookSpeed()
+conns.charSpeed = lp().CharacterAdded:Connect(function()
+    task.wait(0.5)
+    if running then hookSpeed() end
 end)
 
 -- ============================================================
@@ -616,7 +603,7 @@ conns.gyro = RunS.Heartbeat:Connect(function()
     updateGyro()
 end)
 
-conns.charAdded = player.CharacterAdded:Connect(function()
+conns.charAdded = lp().CharacterAdded:Connect(function()
     gyro = nil
     intent.owner = "none"
     intent.pos = nil
@@ -663,23 +650,6 @@ task.spawn(function()
 end)
 
 -- ============================================================
--- ENEMY NERF
--- ============================================================
-task.spawn(function()
-    while running do
-        if C.NerfEnemies then
-            for _, enemy in getAllEnemies() do
-                pcall(function()
-                    if enemy:FindFirstChild("moveSpeed") then enemy.moveSpeed.Value = 0 end
-                    if enemy:FindFirstChild("attackSpeed") then enemy.attackSpeed.Value = 999 end
-                end)
-            end
-        end
-        task.wait(1)
-    end
-end)
-
--- ============================================================
 -- KILL AURA
 -- ============================================================
 task.spawn(function()
@@ -698,7 +668,7 @@ end)
 -- AUTO ABILITY
 -- ============================================================
 local function findAbilityTool(slot)
-    for _, t in player.Backpack:GetChildren() do
+    for _, t in lp().Backpack:GetChildren() do
         if t:IsA("Tool") and t:FindFirstChild("abilitySlot") then
             if t.abilitySlot.Value == slot then return t end
         end
@@ -849,39 +819,26 @@ task.spawn(function()
             local hrp = getHRP()
             if not hum or not hrp then task.wait(0.5) continue end
 
-            local hpPct = hum.Health / hum.MaxHealth
-
-            if hpPct < C.RetreatPct then
-                local enemy = nearest()
-                if enemy and enemy:FindFirstChild("HumanoidRootPart") then
-                    local away = hrp.Position - enemy.HumanoidRootPart.Position
-                    if away.Magnitude > 0 then
-                        requestMove("retreat", hrp.Position + away.Unit * 35, 0.4)
+            local enemy, d = nearest()
+            if enemy and enemy:FindFirstChild("HumanoidRootPart") then
+                local ePos = enemy.HumanoidRootPart.Position
+                if d <= C.FarmDist then
+                    requestMove("orbit", getOrbitPos(ePos), 0.2)
+                    task.wait(0.12)
+                elseif d <= C.FarmDist * 2 then
+                    local ehrp = enemy.HumanoidRootPart
+                    local predicted = ehrp.Position + flatVel(ehrp) * C.LeadTime
+                    local dir = (predicted - hrp.Position)
+                    if dir.Magnitude > 0.1 then
+                        requestMove("orbit", predicted - dir.Unit * C.OrbitDist, 0.25)
                     end
-                end
-                task.wait(0.4)
-            else
-                local enemy, d = nearest()
-                if enemy and enemy:FindFirstChild("HumanoidRootPart") then
-                    local ePos = enemy.HumanoidRootPart.Position
-                    if d <= C.FarmDist then
-                        requestMove("orbit", getOrbitPos(ePos), 0.2)
-                        task.wait(0.12)
-                    elseif d <= C.FarmDist * 2 then
-                        local ehrp = enemy.HumanoidRootPart
-                        local predicted = ehrp.Position + flatVel(ehrp) * C.LeadTime
-                        local dir = (predicted - hrp.Position)
-                        if dir.Magnitude > 0.1 then
-                            requestMove("orbit", predicted - dir.Unit * C.OrbitDist, 0.25)
-                        end
-                        task.wait(0.25)
-                    else
-                        pathTo(enemy, nil)
-                    end
+                    task.wait(0.25)
                 else
-                    local target = nextRoomPos()
-                    if target then pathTo(nil, target) else task.wait(1) end
+                    pathTo(enemy, nil)
                 end
+            else
+                local target = nextRoomPos()
+                if target then pathTo(nil, target) else task.wait(1) end
             end
         end
         task.wait(0.15)
@@ -909,9 +866,10 @@ _G.StopZF = function()
     for _, c in pairs(conns) do
         if typeof(c) == "RBXScriptConnection" then c:Disconnect() end
     end
+    if speedConn then speedConn:Disconnect() end
     if gyro then pcall(function() gyro:Destroy() end) end
     local hum = getHum()
     if hum then hum.WalkSpeed = 16 end
-    pcall(function() app:Destroy() end)
+    if app then pcall(function() app:Destroy() end) end
     print("[ZF7] Stopped")
 end
