@@ -46,7 +46,9 @@ local C = {
     ThreatLookahead = 1.0,  -- seconds ahead to predict incoming projectiles
     MaxTpDist       = 7,    -- per-frame micro-teleport cap (studs) — small on purpose
     TpReactTime     = 0.08, -- only TP when impact is this imminent and inside a hitBox
-    DodgeMax        = 24,   -- max escape step target (studs) — big enough to clear large AoEs
+    DodgeMax        = 24,   -- flee distance when no grid cell is safe (studs)
+    GridHalf        = 4,    -- safe-cell grid is (2*GridHalf+1)^2 cells (9x9)
+    GridSpacing     = 3,    -- studs between grid cells (reach = GridHalf*GridSpacing = 12)
 }
 _G.ZF = C
 
@@ -1057,25 +1059,6 @@ end)
 -- DODGE SYSTEM  [v8.1]  — predict, step minimally, never freeze
 -- ============================================================
 
--- Time (s) until a threat's danger circle first reaches the player's position.
--- Returns nil if it never does within the trajectory. 0 = already inside.
-local function timeToHit(pp, tp, tv, dangerR)
-    local rx, rz = tp.X - pp.X, tp.Z - pp.Z
-    local vx, vz = tv.X, tv.Z
-    local a = vx * vx + vz * vz
-    local c = rx * rx + rz * rz - dangerR * dangerR
-    if a < 1e-4 then
-        return (c <= 0) and 0 or nil  -- stationary: only a threat if we're inside it
-    end
-    if c <= 0 then return 0 end       -- already inside
-    local b = 2 * (rx * vx + rz * vz)
-    local disc = b * b - 4 * a * c
-    if disc < 0 then return nil end
-    local t1 = (-b - math.sqrt(disc)) / (2 * a)
-    if t1 >= 0 then return t1 end
-    return nil                          -- entry is in the past → moving away
-end
-
 -- Raycast the straight line to a candidate dodge spot; true if no solid wall blocks it.
 local rayParams = RaycastParams.new()
 rayParams.FilterType = Enum.RaycastFilterType.Exclude
@@ -1109,7 +1092,10 @@ local function microTeleport(targetPos)
     return true
 end
 
--- Main dodge brain — runs every frame for ~16ms reaction, no task.wait scheduling jitter.
+-- Main dodge brain — GRID METHOD. Runs every frame (~16ms). Snapshots every active
+-- threat, then finds the nearest grid cell that is safe from ALL of them (predicting
+-- each threat's trajectory over the lookahead) and walks there. Handles many overlapping
+-- attacks at once — the weakness of single-threat perpendicular stepping.
 conns.dodge = RunS.Heartbeat:Connect(function()
     if not running then return end
     local bc = DODGE.breadcrumb
@@ -1123,100 +1109,117 @@ conns.dodge = RunS.Heartbeat:Connect(function()
     if not hrp then return end
     local pp = hrp.Position
 
-    -- find the single most imminent threat and the minimal escape it requires
-    local best
+    -- snapshot active threats within range (flat X/Z math for speed)
+    local active = {}
     for part in pairs(threats) do
-        if not part.Parent then continue end
-        local data = threatData[part]
-        if not data then continue end
-        local tp = data.lastPos
-        if flatDist(pp, tp) > C.DodgeRange then continue end
-
-        local tv = data.velocity
-        local dangerR = data.radius + C.ThreatBuffer
-        local tImpact = timeToHit(pp, tp, tv, dangerR)
-        if tImpact == nil or tImpact > C.ThreatLookahead then continue end
-
-        local dodgeDir, need
-        local sp = Vector3.new(tv.X, 0, tv.Z).Magnitude
-        if sp > 1 then
-            -- moving projectile: step perpendicular to its travel line, only until we clear it
-            local vdir = Vector3.new(tv.X, 0, tv.Z) / sp
-            local toP = Vector3.new(pp.X - tp.X, 0, pp.Z - tp.Z)
-            local along = toP:Dot(vdir)
-            local closest = Vector3.new(tp.X, 0, tp.Z) + vdir * along
-            local perpVec = Vector3.new(pp.X - closest.X, 0, pp.Z - closest.Z)
-            local perpDist = perpVec.Magnitude
-            need = (dangerR + C.DodgeMargin) - perpDist
-            if need <= 0 then continue end  -- it's going to miss us anyway
-            dodgeDir = (perpDist > 0.1) and (perpVec / perpDist)
-                       or Vector3.new(-vdir.Z, 0, vdir.X)
-        else
-            -- stationary AoE we're standing in: step straight out, minimally
-            local away = Vector3.new(pp.X - tp.X, 0, pp.Z - tp.Z)
-            local ad = away.Magnitude
-            need = (dangerR + C.DodgeMargin) - ad
-            if need <= 0 then continue end
-            dodgeDir = (ad > 0.1) and (away / ad) or Vector3.new(1, 0, 0)
-        end
-
-        if not best or tImpact < best.t then
-            best = {
-                t = tImpact,
-                dir = dodgeDir,
-                need = math.min(need, C.DodgeMax),
-                name = part.Name,
-                inside = (tImpact <= 0.001),
-                telegraph = data.telegraph == true,
-            }
+        if part.Parent then
+            local dta = threatData[part]
+            if dta then
+                local tp = dta.lastPos
+                if flatDist(pp, tp) <= C.DodgeRange then
+                    active[#active + 1] = {
+                        px = tp.X, pz = tp.Z,
+                        vx = dta.velocity.X, vz = dta.velocity.Z,
+                        dr = dta.radius + C.ThreatBuffer,
+                        telegraph = dta.telegraph == true,
+                        name = part.Name,
+                    }
+                end
+            end
         end
     end
 
-    if not best then
+    if #active == 0 then
         if DODGE.active then clearMove("dodge"); DODGE.active = false end
         bc.action = DODGE.baseAction
         bc.threat = "none"; bc.predict = "-"; bc.target = "-"; bc.reason = "clear"
         return
     end
 
-    -- pick a clear spot: preferred side, else mirror side, else straight out
+    -- Would point (cx,cz) be hit by any threat within the lookahead? `pad` adds clearance.
+    -- Returns worst offending threat + its time-to-closest-approach for the breadcrumb/TP.
+    local function hitAt(cx, cz, pad)
+        local hitT, hitTs = nil, math.huge
+        for _, t in ipairs(active) do
+            local rx, rz = t.px - cx, t.pz - cz
+            local vv = t.vx * t.vx + t.vz * t.vz
+            local ts = 0
+            if vv > 1e-4 then
+                ts = -(rx * t.vx + rz * t.vz) / vv
+                ts = (ts < 0) and 0 or (ts > C.ThreatLookahead and C.ThreatLookahead or ts)
+            end
+            local dx, dz = rx + t.vx * ts, rz + t.vz * ts
+            local r = t.dr + pad
+            if dx * dx + dz * dz < r * r then
+                if ts < hitTs then hitT, hitTs = t, ts end
+            end
+        end
+        return hitT, hitTs
+    end
+
+    -- Am I in danger right now (or imminently)?
+    local whoT, whoTs = hitAt(pp.X, pp.Z, 0)
+    if not whoT then
+        if DODGE.active then clearMove("dodge"); DODGE.active = false end
+        bc.action = DODGE.baseAction
+        bc.threat = "safe (" .. #active .. " near)"; bc.predict = "-"; bc.target = "-"; bc.reason = "clear"
+        return
+    end
+
+    -- Grid search: nearest cell safe from ALL threats and reachable (no wall between).
     DODGE.active = true
-    local off = best.need
-    local candidate = pp + best.dir * off
-    local boxedIn = false
-    if not clearPath(pp, candidate) then
-        local mirror = pp - best.dir * off
-        if clearPath(pp, mirror) then
-            candidate = mirror
-        else
-            boxedIn = true  -- both directions blocked by walls
+    local N, s = C.GridHalf, C.GridSpacing
+    local best, bestD2
+    for gx = -N, N do
+        for gz = -N, N do
+            if gx ~= 0 or gz ~= 0 then
+                local d2 = (gx * gx + gz * gz) * s * s
+                if not bestD2 or d2 < bestD2 then
+                    local cx, cz = pp.X + gx * s, pp.Z + gz * s
+                    if not hitAt(cx, cz, C.DodgeMargin) then
+                        local cellPos = Vector3.new(cx, pp.Y, cz)
+                        if clearPath(pp, cellPos) then
+                            best, bestD2 = cellPos, d2
+                        end
+                    end
+                end
+            end
         end
     end
 
-    bc.threat  = best.name
-    bc.predict = best.inside and (best.telegraph and "telegraph, exit now" or "inside hitBox!")
-                 or string.format("impact ~%.2fs", best.t)
-    bc.target  = string.format("%.0f, %.0f", candidate.X, candidate.Z)
+    local imminent = (not whoT.telegraph) and whoTs <= C.TpReactTime
+    bc.threat  = whoT.name .. (#active > 1 and (" +" .. (#active - 1)) or "")
+    bc.predict = whoT.telegraph and "telegraph" or string.format("hit ~%.2fs", whoTs)
 
-    -- PRIMARY dodge is walking. At WalkSpeed 20 this clears a big AoE in well under a
-    -- second, and precast telegraphs give ~1s warning — so walking alone avoids most
-    -- hits. Crucially we do NOT write CFrame here; that would interrupt the walk.
-    requestMove("dodge", candidate, 0.2)
-
-    -- Micro-TP is a RARE discrete escape, hard rate-limited (0.3s) so it can't fight the
-    -- walk loop: only when a hit is genuinely imminent with no time to walk, or boxed in.
-    local imminent = best.inside and not best.telegraph and best.t <= C.TpReactTime
-    if imminent or boxedIn then
-        if microTeleport(candidate) then
-            bc.action = boxedIn and "TP (boxed in)" or "DODGE+TP"
+    if best then
+        requestMove("dodge", best, 0.2)  -- PRIMARY: walk to safe cell (no CFrame = no freeze)
+        bc.target = string.format("%.0f, %.0f", best.X, best.Z)
+        if imminent and microTeleport(best) then
+            bc.action = "DODGE+TP"
         else
             bc.action = "DODGE"
         end
-        bc.reason = string.format("escaping hit (%.0f studs out)", off)
+        bc.reason = string.format("safe cell %.0f studs away", math.sqrt(bestD2))
     else
-        bc.action = "DODGE"
-        bc.reason = best.telegraph and string.format("leave telegraph (%.0f studs)", off)
-                    or string.format("step %.1f studs aside", off)
+        -- No safe cell in the grid: flee directly away from the weighted threat center.
+        local ax, az = 0, 0
+        for _, t in ipairs(active) do
+            local dx, dz = pp.X - t.px, pp.Z - t.pz
+            local d = math.sqrt(dx * dx + dz * dz)
+            if d > 0.1 then local w = 1 / d; ax = ax + (dx / d) * w; az = az + (dz / d) * w end
+        end
+        local m = math.sqrt(ax * ax + az * az)
+        local dir = (m > 0.01) and Vector3.new(ax / m, 0, az / m)
+                    or (hrp.CFrame.LookVector * Vector3.new(1, 0, 1)).Unit
+        local cand = pp + dir * C.DodgeMax
+        requestMove("dodge", cand, 0.2)
+        bc.target = string.format("%.0f, %.0f", cand.X, cand.Z)
+        if imminent and microTeleport(cand) then
+            bc.action = "FLEE+TP"
+        else
+            bc.action = "FLEE"
+        end
+        bc.reason = "no safe cell, fleeing " .. #active .. " threats"
     end
 end)
 
@@ -1370,7 +1373,7 @@ conns.dbg = RunS.Heartbeat:Connect(function(dt)
 end)
 
 -- ============================================================
-print("[ZF8] ZeroFarm v8.1 Active — Cascade UI + Debug HUD")
+print("[ZF8] ZeroFarm v8.3 Active — Grid Dodge + Cascade UI + Debug HUD")
 
 _G.StopZF = function()
     running = false
