@@ -28,7 +28,7 @@ local C = {
     DodgeRange   = 50,
     AutoStart    = true,
     AutoReplay   = true,   -- auto-replay the dungeon when it completes or you run out of time
-    ReplayDelay  = 4,      -- seconds to wait (loot/reward screens) before firing replay
+    ReplayDelay  = 2,      -- seconds to wait (loot/reward screens) before firing replay
     NoStun       = true,
     Noclip       = false,
     Debug        = true,
@@ -48,9 +48,17 @@ local C = {
     -- dodge tuning
     ThreatBuffer    = 2.5,  -- extra studs added to each threat's radius
     DodgeMargin     = 2.5,  -- clearance beyond the danger radius when stepping aside
-    ThreatLookahead = 1.0,  -- seconds ahead to predict incoming projectiles (movement)
+    ThreatLookahead = 1.0,  -- seconds ahead to predict stationary/AoE overlap
+    ProjLookahead   = 1.8,  -- seconds ahead to predict MOVING projectile trajectories (earlier)
     GrowthLookahead = 0.45, -- seconds ahead to predict a growing hitbox's size
     MaxGrowth       = 45,   -- cap on predicted growth inflation per axis (studs)
+    MaxBossDist     = 46,   -- try not to dodge farther than this from the current target
+    -- micro-teleport: last-resort ONLY, used when walking can't clear an imminent hit in time.
+    -- Kept small + rate-limited so the server doesn't rubber-band us.
+    MicroTP         = true,
+    MicroTPDist     = 9,    -- max studs per micro-teleport
+    MicroTPCooldown = 0.4,  -- min seconds between micro-teleports (anti rubber-band)
+    MicroTPReact    = 0.16, -- only TP when impact is sooner than this AND walking can't reach
     GridHalf        = 4,    -- safe-cell grid is (2*GridHalf+1)^2 cells (9x9)
     GridSpacing     = 3,    -- studs between grid cells (reach = GridHalf*GridSpacing = 12)
     MaxThreats      = 16,   -- cap threats reasoned about per frame (nearest first) for perf
@@ -395,9 +403,12 @@ end
 
 -- Shared dodge/AI state (declared early so CharacterAdded handlers can reset it)
 local DODGE = {
-    active     = false,
-    baseAction = "scan",   -- what the AI would do if no threat (set by main loop)
-    breadcrumb = { action = "init", threat = "none", predict = "-", target = "-", reason = "-" },
+    active      = false,
+    lastTp      = 0,       -- last micro-teleport time (rate limiting)
+    strafeUntil = 0,       -- telegraph pre-dodge: keep strafing until this time
+    strafeDir   = nil,     -- Vector3 lateral direction chosen for the current telegraph
+    baseAction  = "scan",  -- what the AI would do if no threat (set by main loop)
+    breadcrumb  = { action = "init", threat = "none", predict = "-", target = "-", reason = "-" },
 }
 
 -- ============================================================
@@ -1040,18 +1051,83 @@ local function isPlayerProjectile(inst)
     return false
 end
 
--- DETECTION: treat any NEW non-collidable part that appears in workspace as a potential
--- threat. Boss attacks (from mapSpecificLocals, EnemyClientEffects, or anywhere) are always
--- non-collidable parts spawned into workspace during the fight; walls/floors/props are
--- collidable, and character armor/bodies + our own spell projectiles are excluded. This is
--- intentionally broad — the OBB grid dodge only actually MOVES when the player is inside a
--- part's box, so harmless distant parts are tracked but never trigger a dodge. Parts are
--- auto-untracked when destroyed. We do NOT seed pre-existing parts (only new spawns count).
+-- A part name looks like an attack hazard (damage/telegraph/beam/circle keywords).
+local function isHazardName(n)
+    local l = n:lower()
+    return (l:find("damage") or l:find("hit") or l:find("aoe") or l:find("zone")
+        or l:find("area") or l:find("beam") or l:find("precast") or l:find("telegraph")
+        or l:find("blast") or l:find("wave") or l:find("shock") or l:find("lava")
+        or l:find("flame") or l:find("cyclone") or l:find("circle") or l:find("line")
+        or l:find("slam") or l:find("spike") or l:find("orb") or l:find("bomb")
+        or l:find("shot") or l:find("proj")) ~= nil
+end
+
+-- Names of every attack part in the two template folders (enemyProjectiles = mapSpecificLocals,
+-- enemyAssets = EnemyClientEffects). A workspace part with one of these names was cloned from
+-- an attack. Generic names (armor/mesh/anchor bits) are excluded so decor can't match.
+local GENERIC_PART = {
+    Model=true, Folder=true, Part=true, MeshPart=true, Union=true, UnionOperation=true,
+    Wedge=true, WedgePart=true, Handle=true, ArmorMesh=true, newPart=true, Mesh=true,
+    Bone=true, Head=true, Torso=true, PrimaryPart=true, Accessory=true, glowPart=true,
+}
+local ATTACK_NAMES = {}
+do
+    for _, folderName in { "enemyProjectiles", "enemyAssets" } do
+        local f = Rep:FindFirstChild(folderName)
+        if f then
+            for _, d in f:GetDescendants() do
+                if d:IsA("BasePart") and not GENERIC_PART[d.Name] then ATTACK_NAMES[d.Name] = true end
+            end
+        end
+    end
+end
+
+-- TELEGRAPH ANTICIPATION: when a circle / ground-slam AoE aimed at us appears, start moving
+-- laterally IMMEDIATELY (perpendicular to the boss→player line) before it grows/activates.
+-- This is Bob's "circle in your direction" attack — reacting to the finished circle is too
+-- late, so we pre-empt it with a committed sideways strafe.
+local function triggerTelegraphStrafe(part)
+    local hrp = getHRP(); if not hrp then return end
+    local ok, pos = pcall(function() return part.Position end)
+    if not ok then return end
+    if flatDist(hrp.Position, pos) > 45 then return end   -- only if aimed near us
+    local ref = currentTarget and currentTarget:FindFirstChild("HumanoidRootPart")
+    local base = ref and ref.Position or pos
+    local toP = Vector3.new(hrp.Position.X - base.X, 0, hrp.Position.Z - base.Z)
+    if toP.Magnitude < 0.1 then toP = hrp.CFrame.LookVector * Vector3.new(1, 0, 1) end
+    local perp = Vector3.new(-toP.Z, 0, toP.X)
+    if perp.Magnitude < 0.1 then return end
+    perp = perp.Unit
+    if tick() > DODGE.strafeUntil then  -- new telegraph window: commit to one side
+        DODGE.strafeDir = (math.random() < 0.5) and perp or -perp
+    end
+    DODGE.strafeUntil = tick() + 0.7
+end
+
+-- Is this newly-added part an actual ATTACK (not ambient decor)? A real attack part is
+-- non-collidable, not on a character, not our own spell, AND is one of: cloned from an attack
+-- template (ATTACK_NAMES), hazard-named, or Neon (attack visuals). This precise filter is the
+-- fix for false threats — the lobby alone has ~50 non-collidable decor parts, and treating
+-- every one as a threat floods the list and evicts the real attack under the MaxThreats cap.
+local function looksLikeAttack(d)
+    if not d:IsA("BasePart") then return false end
+    if d.CanCollide then return false end
+    local sz = d.Size
+    if math.max(sz.X, sz.Y, sz.Z) < 1 then return false end
+    if inCharacter(d) or isPlayerProjectile(d) then return false end
+    if ATTACK_NAMES[d.Name] or isHazardName(d.Name) then return true end
+    local ok, neon = pcall(function() return d.Material == Enum.Material.Neon end)
+    return ok and neon
+end
+
 conns.ptAdd = workspace.DescendantAdded:Connect(function(d)
-    if d:IsA("BasePart") and not d.CanCollide and not inCharacter(d) and not isPlayerProjectile(d) then
-        local sz = d.Size
-        if math.max(sz.X, sz.Y, sz.Z) >= 1 then  -- skip tiny particle/fx bits
-            threats[d] = true
+    if looksLikeAttack(d) then
+        threats[d] = true
+        if C.AutoDodge then
+            local ln = d.Name:lower()
+            if ln:find("circle") or ln:find("groundslam") or ln:find("slam") or ln:find("aoe") or d.Name == "precast" then
+                triggerTelegraphStrafe(d)
+            end
         end
     end
 end)
@@ -1087,12 +1163,17 @@ conns.threatTrack = RunS.Heartbeat:Connect(function(dt)
             data.growth = data.growth:Lerp(rawGrow, 0.5)
             data.lastSize = sz
         else
+            local isNeon = false
+            pcall(function() isNeon = part.Material == Enum.Material.Neon end)
             threatData[part] = {
                 lastPos = pos,
                 velocity = Vector3.zero,
                 lastSize = sz,
                 growth = Vector3.zero,
                 telegraph = (part.Name == "precast"),
+                -- hazard = looks like real attack geometry (named or Neon). Static parts that
+                -- are neither hazard nor moving/growing are ignored by the dodge (false-threat filter).
+                hazard = isHazardName(part.Name) or isNeon,
             }
         end
     end
@@ -1101,6 +1182,22 @@ end)
 -- ============================================================
 -- DODGE SYSTEM  [v8.1]  — predict, step minimally, never freeze
 -- ============================================================
+
+-- Small, rate-limited CFrame hop toward safety. LAST RESORT only (see dodge loop): used
+-- when an attack is about to connect and walking can't clear the danger in time. Capped
+-- distance + a cooldown keep CFrame writes rare so the server doesn't rubber-band us.
+local function microTeleport(targetPos)
+    local hrp = getHRP(); if not hrp then return false end
+    if tick() - DODGE.lastTp < C.MicroTPCooldown then return false end
+    local delta = targetPos - hrp.Position
+    local flat = Vector3.new(delta.X, 0, delta.Z)
+    local dmag = flat.Magnitude
+    if dmag < 0.5 then return false end
+    if dmag > C.MicroTPDist then flat = flat.Unit * C.MicroTPDist end
+    hrp.CFrame = hrp.CFrame + flat
+    DODGE.lastTp = tick()
+    return true
+end
 
 -- Main dodge brain — GRID METHOD. Runs every frame (~16ms). Snapshots every active
 -- threat, then finds the nearest grid cell that is safe from ALL of them (predicting
@@ -1119,10 +1216,12 @@ conns.dodge = RunS.Heartbeat:Connect(function()
     if not hrp then return end
     local pp = hrp.Position
 
-    -- Snapshot active threats. Each is treated as an ORIENTED BOX (its real CFrame+Size),
-    -- not a circle — critical for long thin beams (a 150-stud beam is not a 75-radius disc).
+    -- Snapshot active threats as ORIENTED BOXES (real CFrame+Size — a 150-stud beam is not a
+    -- 75-radius disc). Moving projectiles get a LONGER lookahead + larger inclusion range so
+    -- we react while they're still far but on-course. FALSE-THREAT FILTER: a part only counts
+    -- if it's moving, growing, a telegraph, or hazard-named/Neon — static harmless props are
+    -- ignored so we never dodge nothing.
     local active = {}
-    local LA = C.ThreatLookahead
     for part in pairs(threats) do
         if part.Parent then
             local dta = threatData[part]
@@ -1130,88 +1229,119 @@ conns.dodge = RunS.Heartbeat:Connect(function()
                 local ok, cf = pcall(function() return part.CFrame end)
                 if ok then
                     local sz = part.Size
-                    -- PREDICT growth: a hitbox tweening larger is treated as its near-future
-                    -- size NOW, so we leave before the expanding edge reaches us. Only inflate
-                    -- (growing), never shrink, and cap the inflation so a huge fast wave can't
-                    -- flag the whole map.
+                    -- predict growth: treat a tweening-larger hitbox as its near-future size
                     local g = dta.growth
                     local gx = math.clamp((g.X > 0 and g.X or 0) * C.GrowthLookahead * 0.5, 0, C.MaxGrowth)
                     local gy = math.clamp((g.Y > 0 and g.Y or 0) * C.GrowthLookahead * 0.5, 0, C.MaxGrowth)
                     local gz = math.clamp((g.Z > 0 and g.Z or 0) * C.GrowthLookahead * 0.5, 0, C.MaxGrowth)
                     local hx, hy, hz = sz.X * 0.5 + gx, sz.Y * 0.5 + gy, sz.Z * 0.5 + gz
-                    local maxHalf = math.max(hx, hy, hz)
-                    local edgeDist = flatDist(pp, cf.Position) - maxHalf
-                    -- include long beams whose center is far but body is near
-                    if edgeDist <= C.DodgeRange then
-                        local v = dta.velocity
-                        active[#active + 1] = {
-                            cf = cf, hx = hx, hy = hy, hz = hz,
-                            vx = v.X, vy = v.Y, vz = v.Z,
-                            px = cf.Position.X, pz = cf.Position.Z,
-                            moving = (v.X * v.X + v.Z * v.Z) > 4,
-                            growing = (gx + gy + gz) > 1,
-                            telegraph = dta.telegraph == true,
-                            name = part.Name,
-                            edge = edgeDist,
-                        }
+                    local v = dta.velocity
+                    local speed = math.sqrt(v.X * v.X + v.Z * v.Z)
+                    local moving = speed > 2
+                    local growing = (gx + gy + gz) > 1
+                    -- only real hazards trigger dodges
+                    if moving or growing or dta.telegraph or dta.hazard then
+                        local la = moving and C.ProjLookahead or C.ThreatLookahead
+                        local reach = moving and (C.DodgeRange + speed * C.ProjLookahead) or C.DodgeRange
+                        local maxHalf = math.max(hx, hy, hz)
+                        local edgeDist = flatDist(pp, cf.Position) - maxHalf
+                        if edgeDist <= reach then
+                            active[#active + 1] = {
+                                cf = cf, hx = hx, hy = hy, hz = hz,
+                                vx = v.X, vy = v.Y, vz = v.Z,
+                                px = cf.Position.X, pz = cf.Position.Z,
+                                moving = moving, growing = growing,
+                                telegraph = dta.telegraph == true,
+                                la = la, samples = moving and 6 or 1,
+                                name = part.Name, edge = edgeDist,
+                            }
+                        end
                     end
                 end
             end
         end
     end
 
-    -- Bound per-frame cost: only reason about the nearest few threats (the ones that can
-    -- actually hit us). A busy scene with dozens of tracked parts can't lag the grid loop.
+    local py = pp.Y
+    -- min OBB clearance of point (cx,py,cz) to threat t over t's lookahead, and the sample
+    -- time at which it's closest (time-to-impact for that threat).
+    local function threatClr(t, cx, cz)
+        local minD, mFt = math.huge, 0
+        for si = 1, t.samples do
+            local ft = (t.samples == 1) and 0 or (t.la * (si - 1) / (t.samples - 1))
+            local lp = t.cf:PointToObjectSpace(Vector3.new(cx - t.vx * ft, py - t.vy * ft, cz - t.vz * ft))
+            local dx = math.abs(lp.X) - t.hx; if dx < 0 then dx = 0 end
+            local dy = math.abs(lp.Y) - t.hy; if dy < 0 then dy = 0 end
+            local dz = math.abs(lp.Z) - t.hz; if dz < 0 then dz = 0 end
+            local dd = math.sqrt(dx * dx + dy * dy + dz * dz)
+            if dd < minD then minD, mFt = dd, ft end
+        end
+        return minD, mFt
+    end
+
+    -- CULL BY ACTUAL DANGER: keep the MaxThreats threats with the smallest predicted clearance
+    -- TO THE PLAYER. (Culling by center-distance let big harmless parts evict the real
+    -- overlapping threat — the "reads safe while standing in an attack" bug.)
+    for _, t in ipairs(active) do t.pClr, t.pFt = threatClr(t, pp.X, pp.Z) end
     if #active > C.MaxThreats then
-        table.sort(active, function(a, b) return a.edge < b.edge end)
+        table.sort(active, function(a, b) return a.pClr < b.pClr end)
         for i = #active, C.MaxThreats + 1, -1 do active[i] = nil end
     end
 
-    if #active == 0 then
-        if DODGE.active then clearMove("dodge"); DODGE.active = false end
-        bc.action = DODGE.baseAction
-        bc.threat = "none"; bc.predict = "-"; bc.target = "-"; bc.reason = "clear"
-        return
+    -- boss position (to avoid dodging too far away from our target)
+    local bossPos
+    if currentTarget and currentTarget.Parent then
+        local bh = currentTarget:FindFirstChild("HumanoidRootPart")
+        if bh then bossPos = bh.Position end
     end
 
-    -- Clearance of point (cx, cz) = distance to the NEAREST threat box (now, or predicted
-    -- over the lookahead for moving ones), using point-to-oriented-box distance. cy = player
-    -- height, so beams above/below don't count. Also returns the nearest threat (for HUD).
-    local py = pp.Y
+    -- clearance of an arbitrary grid cell = min over the kept threats
     local function clearanceAt(cx, cz)
         local minD, who = math.huge, nil
         for _, t in ipairs(active) do
-            local samples = t.moving and 3 or 1
-            for si = 1, samples do
-                local ft = (samples == 1) and 0 or (LA * (si - 1) / (samples - 1))
-                local lp = t.cf:PointToObjectSpace(Vector3.new(cx - t.vx * ft, py - t.vy * ft, cz - t.vz * ft))
-                local dx = math.abs(lp.X) - t.hx; if dx < 0 then dx = 0 end
-                local dy = math.abs(lp.Y) - t.hy; if dy < 0 then dy = 0 end
-                local dz = math.abs(lp.Z) - t.hz; if dz < 0 then dz = 0 end
-                local dd = math.sqrt(dx * dx + dy * dy + dz * dz)
-                if dd < minD then minD, who = dd, t end
-            end
+            local dd = threatClr(t, cx, cz)
+            if dd < minD then minD, who = dd, t end
         end
         return minD, who
     end
 
-    -- Am I in danger right now? (standing within ThreatBuffer of a threat box)
-    local myClr, whoT = clearanceAt(pp.X, pp.Z)
-    if myClr >= C.ThreatBuffer then
-        -- SAFE: stop dodging and hold this spot; let the main loop resume (no walking forever)
+    -- player danger from the per-threat clearances already computed
+    local myClr, whoT, whoFt = math.huge, nil, 0
+    for _, t in ipairs(active) do
+        if t.pClr < myClr then myClr, whoT, whoFt = t.pClr, t, t.pFt end
+    end
+
+    -- SAFE right now. If a telegraph pre-dodge is committed, keep strafing laterally to leave
+    -- the predicted circle BEFORE it activates; otherwise stop and let the main loop resume.
+    if #active == 0 or myClr >= C.ThreatBuffer then
+        if tick() < DODGE.strafeUntil and DODGE.strafeDir then
+            local cand = pp + DODGE.strafeDir * 16
+            if not clearPath(pp, cand) then
+                DODGE.strafeDir = -DODGE.strafeDir
+                cand = pp + DODGE.strafeDir * 16
+            end
+            if clearPath(pp, cand) then
+                DODGE.active = true
+                requestMove("dodge", cand, 0.2)
+                bc.action = "PRE-DODGE"; bc.threat = "telegraph"; bc.predict = "strafing"
+                bc.target = string.format("%.0f, %.0f", cand.X, cand.Z); bc.reason = "anticipating circle"
+                return
+            end
+        end
         if DODGE.active then clearMove("dodge"); DODGE.active = false end
         bc.action = DODGE.baseAction
-        bc.threat = "safe (" .. #active .. " near)"; bc.predict = "-"; bc.target = "-"; bc.reason = "clear"
+        bc.threat = (#active > 0) and ("safe (" .. #active .. " near)") or "none"
+        bc.predict = "-"; bc.target = "-"; bc.reason = "clear"
         return
     end
 
-    -- Grid search: nearest cell that is fully safe AND reachable. Also remember the cell with
-    -- the most clearance as a fallback, so a boss AoE with no perfectly-safe cell still moves
-    -- us to the LEAST dangerous reachable spot (a bounded step) rather than nowhere.
+    -- In danger: grid-search the nearest reachable SAFE cell. Cost = distance moved + a
+    -- penalty for ending up too far from the boss (so we don't create bad long-range spacing).
+    -- Track a max-clearance cover cell as fallback for inescapable AoEs.
     DODGE.active = true
     local cellPad = C.ThreatBuffer + C.DodgeMargin
     local N, s = C.GridHalf, C.GridSpacing
-    local bestSafe, bestSafeD2
+    local bestSafe, bestSafeCost, bestSafeD2
     local bestCover, bestCoverClr = nil, myClr
     for gx = -N, N do
         for gz = -N, N do
@@ -1220,9 +1350,14 @@ conns.dodge = RunS.Heartbeat:Connect(function()
                 local clr = clearanceAt(cx, cz)
                 if clr >= cellPad then
                     local d2 = (gx * gx + gz * gz) * s * s
-                    if (not bestSafeD2 or d2 < bestSafeD2) then
+                    local cost = d2
+                    if bossPos then
+                        local bd = flatDist(Vector3.new(cx, py, cz), bossPos)
+                        if bd > C.MaxBossDist then cost = cost + (bd - C.MaxBossDist) ^ 2 * 6 end
+                    end
+                    if not bestSafeCost or cost < bestSafeCost then
                         local cp = Vector3.new(cx, py, cz)
-                        if clearPath(pp, cp) then bestSafe, bestSafeD2 = cp, d2 end
+                        if clearPath(pp, cp) then bestSafe, bestSafeCost, bestSafeD2 = cp, cost, d2 end
                     end
                 elseif not bestSafe and clr > bestCoverClr then
                     local cp = Vector3.new(cx, py, cz)
@@ -1233,14 +1368,23 @@ conns.dodge = RunS.Heartbeat:Connect(function()
     end
 
     local kind = whoT and (whoT.growing and "growing" or (whoT.moving and "incoming" or "AoE")) or "?"
-    bc.threat  = (whoT and whoT.name or "?") .. (#active > 1 and (" +" .. (#active - 1)) or "")
+    bc.threat = (whoT and whoT.name or "?") .. (#active > 1 and (" +" .. (#active - 1)) or "")
 
     local target = bestSafe or bestCover
     if target then
-        requestMove("dodge", target, 0.2)  -- walk to the spot (no CFrame write = no rubber-band)
+        requestMove("dodge", target, 0.2)  -- PRIMARY: walk (no CFrame write = no rubber-band)
         bc.target = string.format("%.0f, %.0f", target.X, target.Z)
+        -- LAST-RESORT micro-TP: only if a hit is about to connect (whoFt tiny) and we cannot
+        -- walk to the safe cell in that time. Rate-limited inside microTeleport.
+        local tpUsed = false
+        if C.MicroTP and bestSafe then
+            local walkTime = math.sqrt(bestSafeD2) / math.max(hum.WalkSpeed, 1)
+            if whoFt <= C.MicroTPReact and walkTime > whoFt then
+                tpUsed = microTeleport(bestSafe)
+            end
+        end
         if bestSafe then
-            bc.action = "DODGE"
+            bc.action = tpUsed and "DODGE+TP" or "DODGE"
             bc.predict = kind
             bc.reason = string.format("safe cell %.0f studs away", math.sqrt(bestSafeD2))
         else
@@ -1249,12 +1393,8 @@ conns.dodge = RunS.Heartbeat:Connect(function()
             bc.reason = string.format("best clearance %.1f studs", bestCoverClr)
         end
     else
-        -- nothing reachable improves our position (walled in): hold, don't wander off
         clearMove("dodge")
-        bc.action = "HOLD"
-        bc.predict = "boxed in"
-        bc.target = "-"
-        bc.reason = "no reachable safer cell"
+        bc.action = "HOLD"; bc.predict = "boxed in"; bc.target = "-"; bc.reason = "no reachable safer cell"
     end
 end)
 
@@ -1412,7 +1552,7 @@ conns.dbg = RunS.Heartbeat:Connect(function(dt)
 end)
 
 -- ============================================================
-print("[ZF8] ZeroFarm v9.2 Active — auto-replay on clear/timeout + predictive dodge")
+print("[ZF8] ZeroFarm v9.4 Active — predictive dodge, cull-by-danger, telegraph strafe, micro-TP")
 
 _G.StopZF = function()
     running = false
