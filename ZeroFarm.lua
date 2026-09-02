@@ -27,6 +27,8 @@ local C = {
     SpellHitbox     = true,  -- expand our own spell projectiles so one cast clears mobs from afar
     SpellHitboxSize = 220,   -- width/length of the enlarged spell disc (studs) — covers a whole room
     SpellHitboxTall = 60,    -- height of the enlarged spell hitbox (studs) — catches tall/flying enemies
+    MobHitbox       = true,  -- enlarge enemy HumanoidRootParts (client-side) so spells reach them from afar
+    MobHitboxSize   = 150,   -- target HRP size for mobs/bosses (studs) — bigger = hittable from farther
     AutoDodge    = true,
     DodgeRange   = 50,
     AutoStart    = true,
@@ -144,6 +146,7 @@ do -- Combat tab
     toggle(form, "Kill Aura", "Spam weaponUsed remote to hit nearby enemies.", "KillAura")
     toggle(form, "Auto Ability", "Cast Q/E abilities via Tool localEvent, respects cooldowns.", "AutoAbility")
     toggle(form, "Spell Hitbox", "Expand our spell projectiles so they hit bosses/mobs from range.", "SpellHitbox")
+    toggle(form, "Mob Hitbox", "Enlarge enemy hitboxes (client) so spells reach them from afar.", "MobHitbox")
     toggle(form, "Auto Dodge", "Predictive, minimal-offset projectile avoidance.", "AutoDodge")
     toggle(form, "No Stun", "Remove stunned tag and PlatformStand.", "NoStun")
     toggle(form, "Noclip", "Walk through walls and objects.", "Noclip")
@@ -1210,6 +1213,29 @@ conns.spellExpand = workspace.DescendantAdded:Connect(function(d)
 end)
 
 -- ============================================================
+-- MOB HITBOX EXPANDER — enlarge enemy HumanoidRootParts (client-side)
+-- ============================================================
+-- Enemy HRPs are non-collidable, and a client-side Size change persists locally (the server
+-- does not revert it). If the hit pipeline consults the enemy's HRP, ballooning it makes
+-- spells register on far-away mobs/bosses without the player approaching. The enemy's actual
+-- appearance/mesh parts are untouched (only the invisible root box grows). Re-applied on a
+-- timer so newly-spawned enemies are covered.
+task.spawn(function()
+    while running do
+        if C.MobHitbox then
+            local want = C.MobHitboxSize
+            for _, e in getAllEnemies() do
+                local eh = e:FindFirstChild("HumanoidRootPart")
+                if eh and eh.Size.X < want then
+                    pcall(function() eh.Size = Vector3.new(want, want, want) end)
+                end
+            end
+        end
+        task.wait(0.25)
+    end
+end)
+
+-- ============================================================
 -- DODGE SYSTEM  [v8.1]  — predict, step minimally, never freeze
 -- ============================================================
 
@@ -1582,7 +1608,7 @@ conns.dbg = RunS.Heartbeat:Connect(function(dt)
 end)
 
 -- ============================================================
-print("[ZF8] ZeroFarm v9.5 Active — spell hitbox expander + predictive dodge")
+print("[ZF8] ZeroFarm v9.6 Active — spell + mob hitbox expanders")
 
 _G.StopZF = function()
     running = false
