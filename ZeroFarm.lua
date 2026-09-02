@@ -25,8 +25,8 @@ local C = {
     KillAura     = true,
     AutoAbility  = true,
     SpellHitbox     = true,  -- expand our own spell projectiles so one cast clears mobs from afar
-    SpellHitboxSize = 220,   -- width/length of the enlarged spell disc (studs) — covers a whole room
-    SpellHitboxTall = 60,    -- height of the enlarged spell hitbox (studs) — catches tall/flying enemies
+    SpellHitboxSize = 2200,  -- width/length of the enlarged spell disc (studs) — 10x, map-wide
+    SpellHitboxTall = 600,   -- height of the enlarged spell hitbox (studs) — catches tall/flying enemies
     MobHitbox       = false, -- (does NOT work: enemy geometry is server-authoritative; client HRP
                              --  resize never reaches the server's hit check. Kept as a toggle only.)
     MobHitboxSize   = 400,   -- target HRP size for mobs/bosses (studs)
