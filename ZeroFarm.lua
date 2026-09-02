@@ -27,6 +27,8 @@ local C = {
     AutoDodge    = true,
     DodgeRange   = 50,
     AutoStart    = true,
+    AutoReplay   = true,   -- auto-replay the dungeon when it completes or you run out of time
+    ReplayDelay  = 4,      -- seconds to wait (loot/reward screens) before firing replay
     NoStun       = true,
     Noclip       = false,
     Debug        = true,
@@ -46,7 +48,9 @@ local C = {
     -- dodge tuning
     ThreatBuffer    = 2.5,  -- extra studs added to each threat's radius
     DodgeMargin     = 2.5,  -- clearance beyond the danger radius when stepping aside
-    ThreatLookahead = 1.0,  -- seconds ahead to predict incoming projectiles
+    ThreatLookahead = 1.0,  -- seconds ahead to predict incoming projectiles (movement)
+    GrowthLookahead = 0.45, -- seconds ahead to predict a growing hitbox's size
+    MaxGrowth       = 45,   -- cap on predicted growth inflation per axis (studs)
     GridHalf        = 4,    -- safe-cell grid is (2*GridHalf+1)^2 cells (9x9)
     GridSpacing     = 3,    -- studs between grid cells (reach = GridHalf*GridSpacing = 12)
     MaxThreats      = 16,   -- cap threats reasoned about per frame (nearest first) for perf
@@ -132,6 +136,7 @@ do -- Combat tab
     toggle(form, "No Stun", "Remove stunned tag and PlatformStand.", "NoStun")
     toggle(form, "Noclip", "Walk through walls and objects.", "Noclip")
     toggle(form, "Auto Start", "Auto ready-up and start dungeons.", "AutoStart")
+    toggle(form, "Auto Replay", "Replay the dungeon on complete / out of time.", "AutoReplay")
     toggle(form, "Debug HUD", "Show live dodge breadcrumbs overlay.", "Debug")
     toggle(form, "Clear Debris", "Hide small loose parts so they can't block dodges.", "ClearDebris")
 
@@ -968,6 +973,40 @@ task.spawn(function()
 end)
 
 -- ============================================================
+-- AUTO REPLAY — restart the dungeon when it completes or times out
+-- ============================================================
+-- The server fires loadCompleteGui (dungeon cleared) or loadFailedGui (out of time / all
+-- lives lost) to the client to show the end screen. We listen for either and re-request the
+-- dungeon: replayDungeon is the "Replay" button's remote; we also nudge the normal start
+-- flow as a fallback in case the run returned to the lobby.
+do
+    local replayRemote  = remotes:FindFirstChild("replayDungeon")
+    local completeEvent = remotes:FindFirstChild("loadCompleteGui")
+    local failedEvent   = remotes:FindFirstChild("loadFailedGui")
+    local lastReplay = 0
+
+    local function tryReplay(reason)
+        if not C.AutoReplay then return end
+        if tick() - lastReplay < 8 then return end  -- debounce (both events / spam guard)
+        lastReplay = tick()
+        DODGE.breadcrumb.action = "REPLAY (" .. reason .. ")"
+        task.wait(C.ReplayDelay)                      -- let loot/reward screens resolve
+        if not running or not C.AutoReplay then return end
+        if replayRemote then pcall(function() replayRemote:FireServer() end) end
+        -- fallback: re-ready in case we were sent back to the lobby
+        pcall(function() remotes.changeStartValue:FireServer() end)
+        pcall(function() remotes.readyUp:FireServer() end)
+    end
+
+    if completeEvent then
+        conns.replayComplete = completeEvent.OnClientEvent:Connect(function() tryReplay("cleared") end)
+    end
+    if failedEvent then
+        conns.replayFailed = failedEvent.OnClientEvent:Connect(function() tryReplay("timeout") end)
+    end
+end
+
+-- ============================================================
 -- THREAT TRACKER — velocity-estimating projectile awareness
 -- ============================================================
 local threats = {}      -- [BasePart] = true
@@ -1021,30 +1060,38 @@ conns.ptRem = workspace.DescendantRemoving:Connect(function(d)
     threatData[d] = nil
 end)
 
--- estimate velocity of CFrame-animated projectiles from position deltas
+-- Track each threat's POSITION velocity (for moving projectiles) AND SIZE growth rate (for
+-- expanding attacks — e.g. a pulse wave that tweens Size to 280 studs). Both are estimated
+-- from per-frame deltas and smoothed, so the dodge can PREDICT where the hitbox will be and
+-- how big it will get, and step clear before it arrives.
 conns.threatTrack = RunS.Heartbeat:Connect(function(dt)
     if not running or dt <= 0 then return end
     for part in pairs(threats) do
         if not part.Parent then
             threats[part] = nil; threatData[part] = nil; continue
         end
-        local ok, pos = pcall(function() return part.Position end)
-        if not ok then
+        local pos, sz
+        local ok = pcall(function() pos = part.Position; sz = part.Size end)
+        if not ok or not pos or not sz then
             threats[part] = nil; threatData[part] = nil; continue
         end
         local data = threatData[part]
         if data then
             local rawVel = (pos - data.lastPos) / dt
-            -- ignore one-frame SetPrimaryPartCFrame reposition jumps (fake velocity spikes)
             if rawVel.Magnitude > 400 then rawVel = rawVel.Unit * 400 end
             data.velocity = data.velocity:Lerp(rawVel, 0.4)
             data.lastPos = pos
+            -- size growth rate (studs/sec per axis); ignore huge one-frame jumps
+            local rawGrow = (sz - data.lastSize) / dt
+            if rawGrow.Magnitude > 2000 then rawGrow = rawGrow.Unit * 2000 end
+            data.growth = data.growth:Lerp(rawGrow, 0.5)
+            data.lastSize = sz
         else
-            local sz = part.Size
             threatData[part] = {
                 lastPos = pos,
                 velocity = Vector3.zero,
-                radius = math.max(sz.X, sz.Y, sz.Z) * 0.5,
+                lastSize = sz,
+                growth = Vector3.zero,
                 telegraph = (part.Name == "precast"),
             }
         end
@@ -1083,16 +1130,26 @@ conns.dodge = RunS.Heartbeat:Connect(function()
                 local ok, cf = pcall(function() return part.CFrame end)
                 if ok then
                     local sz = part.Size
-                    local maxHalf = math.max(sz.X, sz.Y, sz.Z) * 0.5
+                    -- PREDICT growth: a hitbox tweening larger is treated as its near-future
+                    -- size NOW, so we leave before the expanding edge reaches us. Only inflate
+                    -- (growing), never shrink, and cap the inflation so a huge fast wave can't
+                    -- flag the whole map.
+                    local g = dta.growth
+                    local gx = math.clamp((g.X > 0 and g.X or 0) * C.GrowthLookahead * 0.5, 0, C.MaxGrowth)
+                    local gy = math.clamp((g.Y > 0 and g.Y or 0) * C.GrowthLookahead * 0.5, 0, C.MaxGrowth)
+                    local gz = math.clamp((g.Z > 0 and g.Z or 0) * C.GrowthLookahead * 0.5, 0, C.MaxGrowth)
+                    local hx, hy, hz = sz.X * 0.5 + gx, sz.Y * 0.5 + gy, sz.Z * 0.5 + gz
+                    local maxHalf = math.max(hx, hy, hz)
                     local edgeDist = flatDist(pp, cf.Position) - maxHalf
                     -- include long beams whose center is far but body is near
                     if edgeDist <= C.DodgeRange then
                         local v = dta.velocity
                         active[#active + 1] = {
-                            cf = cf, hx = sz.X * 0.5, hy = sz.Y * 0.5, hz = sz.Z * 0.5,
+                            cf = cf, hx = hx, hy = hy, hz = hz,
                             vx = v.X, vy = v.Y, vz = v.Z,
                             px = cf.Position.X, pz = cf.Position.Z,
                             moving = (v.X * v.X + v.Z * v.Z) > 4,
+                            growing = (gx + gy + gz) > 1,
                             telegraph = dta.telegraph == true,
                             name = part.Name,
                             edge = edgeDist,
@@ -1175,6 +1232,7 @@ conns.dodge = RunS.Heartbeat:Connect(function()
         end
     end
 
+    local kind = whoT and (whoT.growing and "growing" or (whoT.moving and "incoming" or "AoE")) or "?"
     bc.threat  = (whoT and whoT.name or "?") .. (#active > 1 and (" +" .. (#active - 1)) or "")
 
     local target = bestSafe or bestCover
@@ -1183,7 +1241,7 @@ conns.dodge = RunS.Heartbeat:Connect(function()
         bc.target = string.format("%.0f, %.0f", target.X, target.Z)
         if bestSafe then
             bc.action = "DODGE"
-            bc.predict = "reaching safety"
+            bc.predict = kind
             bc.reason = string.format("safe cell %.0f studs away", math.sqrt(bestSafeD2))
         else
             bc.action = "COVER"
@@ -1354,7 +1412,7 @@ conns.dbg = RunS.Heartbeat:Connect(function(dt)
 end)
 
 -- ============================================================
-print("[ZF8] ZeroFarm v9.0 Active — dodges any new workspace hazard part")
+print("[ZF8] ZeroFarm v9.2 Active — auto-replay on clear/timeout + predictive dodge")
 
 _G.StopZF = function()
     running = false
