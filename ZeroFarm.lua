@@ -28,7 +28,7 @@ local C = {
     SpellHitboxSize = 220,   -- width/length of the enlarged spell disc (studs) — covers a whole room
     SpellHitboxTall = 60,    -- height of the enlarged spell hitbox (studs) — catches tall/flying enemies
     MobHitbox       = true,  -- enlarge enemy HumanoidRootParts (client-side) so spells reach them from afar
-    MobHitboxSize   = 150,   -- target HRP size for mobs/bosses (studs) — bigger = hittable from farther
+    MobHitboxSize   = 400,   -- target HRP size for mobs/bosses (studs) — bigger = hittable from farther
     AutoDodge    = true,
     DodgeRange   = 50,
     AutoStart    = true,
@@ -1218,20 +1218,17 @@ end)
 -- Enemy HRPs are non-collidable, and a client-side Size change persists locally (the server
 -- does not revert it). If the hit pipeline consults the enemy's HRP, ballooning it makes
 -- spells register on far-away mobs/bosses without the player approaching. The enemy's actual
--- appearance/mesh parts are untouched (only the invisible root box grows). Re-applied on a
--- timer so newly-spawned enemies are covered.
-task.spawn(function()
-    while running do
-        if C.MobHitbox then
-            local want = C.MobHitboxSize
-            for _, e in getAllEnemies() do
-                local eh = e:FindFirstChild("HumanoidRootPart")
-                if eh and eh.Size.X < want then
-                    pcall(function() eh.Size = Vector3.new(want, want, want) end)
-                end
-            end
+-- appearance/mesh parts are untouched (only the invisible root box grows). Runs every frame
+-- and forces the exact size, so it holds indefinitely even if the server tries to reset it.
+conns.mobHitbox = RunS.Heartbeat:Connect(function()
+    if not running or not C.MobHitbox then return end
+    local want = C.MobHitboxSize
+    local sz = Vector3.new(want, want, want)
+    for _, e in getAllEnemies() do
+        local eh = e:FindFirstChild("HumanoidRootPart")
+        if eh and eh.Size ~= sz then
+            pcall(function() eh.Size = sz end)
         end
-        task.wait(0.25)
     end
 end)
 
