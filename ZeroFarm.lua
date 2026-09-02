@@ -27,8 +27,9 @@ local C = {
     SpellHitbox     = true,  -- expand our own spell projectiles so one cast clears mobs from afar
     SpellHitboxSize = 220,   -- width/length of the enlarged spell disc (studs) — covers a whole room
     SpellHitboxTall = 60,    -- height of the enlarged spell hitbox (studs) — catches tall/flying enemies
-    MobHitbox       = true,  -- enlarge enemy HumanoidRootParts (client-side) so spells reach them from afar
-    MobHitboxSize   = 400,   -- target HRP size for mobs/bosses (studs) — bigger = hittable from farther
+    MobHitbox       = false, -- (does NOT work: enemy geometry is server-authoritative; client HRP
+                             --  resize never reaches the server's hit check. Kept as a toggle only.)
+    MobHitboxSize   = 400,   -- target HRP size for mobs/bosses (studs)
     AutoDodge    = true,
     DodgeRange   = 50,
     AutoStart    = true,
