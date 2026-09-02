@@ -24,6 +24,9 @@ local C = {
     FarmDist     = 26,
     KillAura     = true,
     AutoAbility  = true,
+    SpellHitbox     = true,  -- expand our own spell projectiles so one cast clears mobs from afar
+    SpellHitboxSize = 220,   -- width/length of the enlarged spell disc (studs) — covers a whole room
+    SpellHitboxTall = 60,    -- height of the enlarged spell hitbox (studs) — catches tall/flying enemies
     AutoDodge    = true,
     DodgeRange   = 50,
     AutoStart    = true,
@@ -140,6 +143,7 @@ do -- Combat tab
 
     toggle(form, "Kill Aura", "Spam weaponUsed remote to hit nearby enemies.", "KillAura")
     toggle(form, "Auto Ability", "Cast Q/E abilities via Tool localEvent, respects cooldowns.", "AutoAbility")
+    toggle(form, "Spell Hitbox", "Expand our spell projectiles so they hit bosses/mobs from range.", "SpellHitbox")
     toggle(form, "Auto Dodge", "Predictive, minimal-offset projectile avoidance.", "AutoDodge")
     toggle(form, "No Stun", "Remove stunned tag and PlatformStand.", "NoStun")
     toggle(form, "Noclip", "Walk through walls and objects.", "Noclip")
@@ -1180,6 +1184,32 @@ conns.threatTrack = RunS.Heartbeat:Connect(function(dt)
 end)
 
 -- ============================================================
+-- SPELL HITBOX EXPANDER — enlarge our OWN spell projectiles so they hit from range
+-- ============================================================
+-- Player spells spawn as a projectile Model (e.g. "Soul Drain" with mesh1/mesh2 discs) that
+-- travels from the character; the server checks those mesh parts against enemies. Enlarging
+-- the discs makes a single cast damage everything in a large radius, so the spell connects
+-- with the boss/mob without the player being close or perfectly aimed. This is the owner's
+-- "hitbox expander" mechanism — reused, scoped ONLY to our own projectiles (never enemy ones).
+conns.spellExpand = workspace.DescendantAdded:Connect(function(d)
+    if not C.SpellHitbox then return end
+    if not d:IsA("BasePart") then return end
+    if not isPlayerProjectile(d) then return end
+    task.spawn(function()
+        for _ = 1, 60 do                    -- hold it expanded for the projectile's whole lifetime
+            if not d.Parent then break end
+            local w, h = C.SpellHitboxSize, C.SpellHitboxTall
+            pcall(function()
+                local s = d.Size
+                -- only grow, never shrink below the spell's own AoE
+                d.Size = Vector3.new(math.max(s.X, w), math.max(s.Y, h), math.max(s.Z, w))
+            end)
+            task.wait(0.03)
+        end
+    end)
+end)
+
+-- ============================================================
 -- DODGE SYSTEM  [v8.1]  — predict, step minimally, never freeze
 -- ============================================================
 
@@ -1552,7 +1582,7 @@ conns.dbg = RunS.Heartbeat:Connect(function(dt)
 end)
 
 -- ============================================================
-print("[ZF8] ZeroFarm v9.4 Active — predictive dodge, cull-by-danger, telegraph strafe, micro-TP")
+print("[ZF8] ZeroFarm v9.5 Active — spell hitbox expander + predictive dodge")
 
 _G.StopZF = function()
     running = false
