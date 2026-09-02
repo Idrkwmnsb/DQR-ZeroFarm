@@ -30,6 +30,9 @@ local C = {
     MobHitbox       = false, -- (does NOT work: enemy geometry is server-authoritative; client HRP
                              --  resize never reaches the server's hit check. Kept as a toggle only.)
     MobHitboxSize   = 400,   -- target HRP size for mobs/bosses (studs)
+    WeaponHitbox    = true,  -- enlarge our equipped melee weapon's Handle (client-owned -> replicates)
+    WeaponHitboxSize= 60,    -- weapon Handle size (studs) — bigger = melee swing reaches farther
+    SwingSpam       = true,  -- also fire the equipped weapon's own swing remote (melee attack)
     AutoDodge    = true,
     DodgeRange   = 50,
     AutoStart    = true,
@@ -148,6 +151,8 @@ do -- Combat tab
     toggle(form, "Auto Ability", "Cast Q/E abilities via Tool localEvent, respects cooldowns.", "AutoAbility")
     toggle(form, "Spell Hitbox", "Expand our spell projectiles so they hit bosses/mobs from range.", "SpellHitbox")
     toggle(form, "Mob Hitbox", "Enlarge enemy hitboxes (client) so spells reach them from afar.", "MobHitbox")
+    toggle(form, "Weapon Hitbox", "Enlarge our melee weapon's Handle so swings hit from range.", "WeaponHitbox")
+    toggle(form, "Swing Spam", "Fire the equipped weapon's own swing (melee) remote.", "SwingSpam")
     toggle(form, "Auto Dodge", "Predictive, minimal-offset projectile avoidance.", "AutoDodge")
     toggle(form, "No Stun", "Remove stunned tag and PlatformStand.", "NoStun")
     toggle(form, "Noclip", "Walk through walls and objects.", "Noclip")
@@ -1234,6 +1239,52 @@ conns.mobHitbox = RunS.Heartbeat:Connect(function()
 end)
 
 -- ============================================================
+-- WEAPON HITBOX EXPANDER — enlarge our equipped melee weapon (client-owned -> replicates)
+-- ============================================================
+-- The weapon is an Accessory on OUR character (client-owned), unlike enemies. A size change
+-- to its Handle replicates up to the server, so IF the server checks the weapon geometry for
+-- swing hits, ballooning the Handle makes a swing hit enemies from far away. The weapon also
+-- has its own `swing` RemoteEvent (the real melee attack — global weaponUsed alone doesn't
+-- trigger it), which we fire alongside the kill aura.
+local function getEquippedWeapon()
+    local ch = getChar(); if not ch then return nil end
+    for _, a in ch:GetChildren() do
+        if a:IsA("Accessory") then
+            local isWep = a:FindFirstChild("Weapon") or (a:FindFirstChild("type") and a.type.Value == "weapon")
+            if isWep then return a end
+        end
+    end
+    return nil
+end
+
+conns.weaponHitbox = RunS.Heartbeat:Connect(function()
+    if not running or not C.WeaponHitbox then return end
+    local w = getEquippedWeapon(); if not w then return end
+    local want = C.WeaponHitboxSize
+    local sz = Vector3.new(want, want, want)
+    for _, part in w:GetDescendants() do
+        if part:IsA("BasePart") and (part.Name == "Handle" or part.Name:lower():find("hit")) then
+            if part.Size ~= sz then pcall(function() part.Size = sz end) end
+        end
+    end
+end)
+
+-- fire the weapon's own swing remote (melee attack) — paired with the kill aura loop
+task.spawn(function()
+    while running do
+        if C.SwingSpam and isAlive() then
+            local w = getEquippedWeapon()
+            local sw = w and w:FindFirstChild("swing")
+            if sw and sw:IsA("RemoteEvent") then
+                local _, d = nearest()
+                if d <= C.SpellRange then pcall(function() sw:FireServer() end) end
+            end
+        end
+        task.wait(0.12 + math.random() * 0.05)
+    end
+end)
+
+-- ============================================================
 -- DODGE SYSTEM  [v8.1]  — predict, step minimally, never freeze
 -- ============================================================
 
@@ -1606,7 +1657,7 @@ conns.dbg = RunS.Heartbeat:Connect(function(dt)
 end)
 
 -- ============================================================
-print("[ZF8] ZeroFarm v9.6 Active — spell + mob hitbox expanders")
+print("[ZF8] ZeroFarm v9.7 Active — weapon hitbox expander + swing spam")
 
 _G.StopZF = function()
     running = false
